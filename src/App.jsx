@@ -84,7 +84,8 @@ export default function BallFundTracker() {
   const [saving, setSaving] = useState(false);
   const [errorMsg, setErrorMsg] = useState("");
 
-  const isAdmin = !!user;
+  const ADMIN_UID = "D4ZDzT4bjlazjno8O0Xt93XujHo1";
+  const isAdmin = user?.uid === ADMIN_UID;
 
   const loadTransactions = useCallback(async () => {
     const snap = await getDocs(TX_COLLECTION);
@@ -215,7 +216,6 @@ export default function BallFundTracker() {
   const handleDelete = async (t) => {
     try {
       await updateDoc(doc(db, "transactions", t.id), {
-        ...t,
         deleted: true,
       });
       await loadTransactions();

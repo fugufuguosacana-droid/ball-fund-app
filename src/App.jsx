@@ -6,6 +6,7 @@ import {
   getDocs,
   addDoc,
   updateDoc,
+  serverTimestamp,
 } from "firebase/firestore";
 import {
   GoogleAuthProvider,
@@ -172,6 +173,10 @@ export default function BallFundTracker() {
     setErrorMsg("");
     const amount = formType === "income" ? computedIncomeAmount : Number(formAmount);
 
+    if (formType === "income" && !Number.isInteger(formParticipants)) {
+      setErrorMsg("参加人数は整数で入力してください");
+      return;
+    }
     if (!amount || amount <= 0) {
       setErrorMsg("金額を正しく入力してください");
       return;
@@ -201,7 +206,7 @@ export default function BallFundTracker() {
       if (editingId) {
         await updateDoc(doc(db, "transactions", editingId), payload);
       } else {
-        await addDoc(TX_COLLECTION, payload);
+        await addDoc(TX_COLLECTION, { ...payload, createdAt: serverTimestamp() });
       }
       await loadTransactions();
       setShowForm(false);
@@ -214,6 +219,8 @@ export default function BallFundTracker() {
   };
 
   const handleDelete = async (t) => {
+    const label = `${fmtDate(t.date)}「${t.memo}」（${t.type === "income" ? "+" : "−"}${yen(t.amount)}）`;
+    if (!window.confirm(`この記帳を削除しますか？\n${label}`)) return;
     try {
       await updateDoc(doc(db, "transactions", t.id), {
         deleted: true,
@@ -368,8 +375,9 @@ export default function BallFundTracker() {
               <input
                 type="number"
                 min={1}
+                step={1}
                 value={formParticipants}
-                onChange={(e) => setFormParticipants(Number(e.target.value))}
+                onChange={(e) => setFormParticipants(Math.round(Number(e.target.value)))}
                 className="bft-input mb-3"
               />
               <p className="bft-muted text-xs mb-3 font-mono">

@@ -3,7 +3,7 @@ service cloud.firestore {
   match /databases/{database}/documents {
 
     // 取引データ：全員が閲覧可能。
-    // 作成・更新・削除は、竜太さんのGoogleアカウント（UID）でログインしている場合のみ許可。
+    // 作成・更新・削除は、管理者のGoogleアカウント（UID）でログインしている場合のみ許可。
     match /transactions/{txId} {
       allow read: if true;
       allow create, update: if request.auth != null

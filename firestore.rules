@@ -1,0 +1,35 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // 管理者PINを保管するドキュメント。
+    // クライアントからは絶対に読めない（read: false）ため、
+    // 会員がコンソール等を覗いてもPINは見えません。
+    match /meta/admin {
+      allow read: if false;
+      // 初回のみ作成可（既にPINがある場合は作成不可＝上書き不可）
+      allow create: if !exists(/databases/$(database)/documents/meta/admin)
+                    && request.resource.data.keys().hasOnly(['pin'])
+                    && request.resource.data.pin is string
+                    && request.resource.data.pin.size() >= 4;
+      allow update, delete: if false;
+    }
+
+    // PIN照合用の使い捨てドキュメント（管理者ログイン時に使用）。
+    // 書き込みが成功する＝PINが合っている、という仕組みです。
+    match /meta/pinProbe {
+      allow read: if false;
+      allow write: if request.resource.data.pin ==
+                      get(/databases/$(database)/documents/meta/admin).data.pin;
+    }
+
+    // 取引データ：全員が閲覧可能。作成・更新はPINが合っている場合のみ。
+    match /transactions/{txId} {
+      allow read: if true;
+      allow create, update: if request.resource.data.pin ==
+                                get(/databases/$(database)/documents/meta/admin).data.pin
+                             && request.resource.data.keys().hasAll(['date', 'type', 'memo', 'amount']);
+      allow delete: if false; // 削除は「deleted: true」への更新で行うため不要
+    }
+  }
+}

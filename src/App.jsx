@@ -3,20 +3,27 @@ import { Lock, Unlock, Plus, Trash2, Pencil, Users, ShoppingCart, Loader2, X } f
 import {
   collection,
   doc,
-  getDoc,
   getDocs,
   addDoc,
   updateDoc,
-  setDoc,
 } from "firebase/firestore";
-import { db } from "./firebase";
+import {
+  GoogleAuthProvider,
+  signInWithPopup,
+  signOut,
+  onAuthStateChanged,
+} from "firebase/auth";
+import { db, auth } from "./firebase";
 
-const ADMIN_DOC = doc(db, "meta", "admin");
-const FLAG_DOC = doc(db, "meta", "flag");
 const TX_COLLECTION = collection(db, "transactions");
 
 const yen = (n) => `¥${Math.abs(n).toLocaleString("ja-JP")}`;
-const today = () => new Date().toISOString().slice(0, 10);
+// JST基準で今日の日付を出す（UTCのまま計算すると深夜0〜9時頃に前日になってしまうため）
+const today = () => {
+  const d = new Date();
+  const jst = new Date(d.getTime() + (9 * 60 - d.getTimezoneOffset()) * 60000);
+  return jst.toISOString().slice(0, 10);
+};
 const fmtDate = (d) => {
   const dt = new Date(d + "T00:00:00");
   return `${dt.getMonth() + 1}/${dt.getDate()}`;
@@ -63,15 +70,9 @@ const styles = `
 export default function BallFundTracker() {
   const [loading, setLoading] = useState(true);
   const [transactions, setTransactions] = useState([]);
-  const [hasPin, setHasPin] = useState(null); // null = unknown yet
-  const [pin, setPin] = useState(""); // held in memory only after unlocking, used to authorize writes
-  const [isAdmin, setIsAdmin] = useState(false);
-  const [showPinGate, setShowPinGate] = useState(false);
-  const [pinInput, setPinInput] = useState("");
-  const [pinError, setPinError] = useState("");
-  const [showSetupPin, setShowSetupPin] = useState(false);
-  const [newPin, setNewPin] = useState("");
-  const [pinSaving, setPinSaving] = useState(false);
+  const [user, setUser] = useState(null);
+  const [authChecked, setAuthChecked] = useState(false);
+  const [authError, setAuthError] = useState("");
 
   const [showForm, setShowForm] = useState(false);
   const [editingId, setEditingId] = useState(null);
@@ -84,6 +85,8 @@ export default function BallFundTracker() {
   const [saving, setSaving] = useState(false);
   const [errorMsg, setErrorMsg] = useState("");
 
+  const isAdmin = !!user;
+
   const loadTransactions = useCallback(async () => {
     const snap = await getDocs(TX_COLLECTION);
     const list = snap.docs
@@ -92,80 +95,42 @@ export default function BallFundTracker() {
     setTransactions(list);
   }, []);
 
-  const load = useCallback(async () => {
-    setLoading(true);
-    try {
-      await loadTransactions();
-    } catch (e) {
-      setErrorMsg(`読み込みに失敗しました（${e?.message || "不明なエラー"}）`);
-    }
-try {
-      const flagSnap = await getDoc(FLAG_DOC);
-      setHasPin(flagSnap.exists() ? !!flagSnap.data().hasPin : false);
-    } catch {
-      setHasPin(false);
-    }
-    setLoading(false);
-  }, [loadTransactions]);
+  useEffect(() => {
+    const unsub = onAuthStateChanged(auth, (u) => {
+      setUser(u);
+      setAuthChecked(true);
+    });
+    return unsub;
+  }, []);
 
   useEffect(() => {
-    load();
-  }, [load]);
+    (async () => {
+      setLoading(true);
+      try {
+        await loadTransactions();
+      } catch (e) {
+        setErrorMsg(`読み込みに失敗しました（${e?.message || "不明なエラー"}）`);
+      }
+      setLoading(false);
+    })();
+  }, [loadTransactions]);
 
   const balance = transactions.reduce(
     (sum, t) => sum + (t.type === "income" ? t.amount : -t.amount),
     0
   );
 
-  const openAdminGate = () => {
-    setPinError("");
-    setPinInput("");
-    if (!hasPin) {
-      setShowSetupPin(true);
-    } else {
-      setShowPinGate(true);
-    }
-  };
-
-  const handleSetupPin = async () => {
-    setPinError("");
-    const trimmed = newPin.trim();
-    if (trimmed.length < 4) {
-      setPinError("4桁以上で設定してください");
-      return;
-    }
- setPinSaving(true);
+  const handleSignIn = async () => {
+    setAuthError("");
     try {
-      await setDoc(ADMIN_DOC, { pin: trimmed });
-      await setDoc(FLAG_DOC, { hasPin: true });
-      setHasPin(true);
-      setPin(trimmed);
-      setIsAdmin(true);
-      setShowSetupPin(false);
-      setNewPin("");
+      await signInWithPopup(auth, new GoogleAuthProvider());
     } catch (e) {
-      setPinError(
-        `設定に失敗しました（${e?.message || "不明なエラー"}）。既にPINが設定済みの場合は「管理者」から通常のログインをお試しください`
-      );
-    } finally {
-      setPinSaving(false);
+      setAuthError(`ログインに失敗しました（${e?.message || "不明なエラー"}）`);
     }
   };
 
-  const handlePinSubmit = async () => {
-    setPinError("");
-    const trimmed = pinInput.trim();
-    // Verify by attempting a harmless write that the security rules will
-    // only allow if the pin matches meta/admin.pin.
-    try {
-      const probeRef = doc(db, "meta", "pinProbe");
-      await setDoc(probeRef, { pin: trimmed, at: Date.now() });
-      setPin(trimmed);
-      setIsAdmin(true);
-      setShowPinGate(false);
-    } catch {
-      setPinError("PINが違います");
-    }
+  const handleSignOut = async () => {
+    await signOut(auth);
   };
 
   const resetForm = () => {
@@ -228,7 +193,6 @@ try {
       privateMemo: formPrivateMemo.trim() || "",
       amount,
       participants: formType === "income" ? formParticipants : null,
-      pin, // required by security rules to authorize the write
       deleted: false,
     };
 
@@ -254,7 +218,6 @@ try {
       await updateDoc(doc(db, "transactions", t.id), {
         ...t,
         deleted: true,
-        pin,
       });
       await loadTransactions();
     } catch (e) {
@@ -273,17 +236,21 @@ try {
         <div className="flex items-start justify-between mb-6">
           <div>
             <p className="bft-muted text-xs tracking-widest uppercase mb-1">Ball Fund</p>
-            <h1 className="text-lg font-semibold">ボール代 管理表</h1>
+            <h1 className="text-lg font-semibold">ボール代 残高表</h1>
           </div>
-          <button
-            onClick={() => (isAdmin ? setIsAdmin(false) : openAdminGate())}
-            className="bft-pill"
-            aria-label={isAdmin ? "管理モードを終了" : "管理モードに入る"}
-          >
-            {isAdmin ? <Unlock size={14} /> : <Lock size={14} />}
-            {isAdmin ? "管理中" : "管理者"}
-          </button>
+          {authChecked && (
+            <button
+              onClick={isAdmin ? handleSignOut : handleSignIn}
+              className="bft-pill"
+              aria-label={isAdmin ? "管理モードを終了" : "管理者としてログイン"}
+            >
+              {isAdmin ? <Unlock size={14} /> : <Lock size={14} />}
+              {isAdmin ? "管理中" : "管理者"}
+            </button>
+          )}
         </div>
+
+        {authError && <p className="bft-error mb-4">{authError}</p>}
 
         <div className="bft-card px-6 py-7 mb-6">
           <p className="bft-muted text-xs mb-2">現在の残高</p>
@@ -366,50 +333,6 @@ try {
           このページはアカウントなしで誰でも閲覧できます
         </p>
       </div>
-
-      {showPinGate && (
-        <Modal onClose={() => setShowPinGate(false)}>
-          <h2 className="text-sm font-semibold mb-3">管理者PINを入力</h2>
-          <input
-            type="password"
-            inputMode="numeric"
-            value={pinInput}
-            onChange={(e) => setPinInput(e.target.value)}
-            onKeyDown={(e) => e.key === "Enter" && handlePinSubmit()}
-            className="bft-input mb-2"
-            placeholder="PINコード"
-            autoFocus
-          />
-          {pinError && <p className="bft-error mb-2">{pinError}</p>}
-          <button onClick={handlePinSubmit} className="bft-btn-primary">
-            入る
-          </button>
-        </Modal>
-      )}
-
-      {showSetupPin && (
-        <Modal onClose={() => setShowSetupPin(false)}>
-          <h2 className="text-sm font-semibold mb-1">管理者PINを設定</h2>
-          <p className="bft-muted text-xs mb-3">
-            初回のみ。他の端末からもこのPINで管理操作ができます。
-          </p>
-          <input
-            type="password"
-            inputMode="numeric"
-            value={newPin}
-            onChange={(e) => setNewPin(e.target.value)}
-            onKeyDown={(e) => e.key === "Enter" && handleSetupPin()}
-            className="bft-input mb-2"
-            placeholder="4桁以上の数字"
-            autoFocus
-          />
-          {pinError && <p className="bft-error mb-2">{pinError}</p>}
-          <button onClick={handleSetupPin} disabled={pinSaving} className="bft-btn-primary">
-            {pinSaving && <Loader2 size={14} className="animate-spin" />}
-            設定して管理者になる
-          </button>
-        </Modal>
-      )}
 
       {showForm && (
         <Modal onClose={() => { setShowForm(false); resetForm(); }}>

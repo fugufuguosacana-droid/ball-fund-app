@@ -18,10 +18,9 @@ import { db, auth } from "./firebase";
 const TX_COLLECTION = collection(db, "transactions");
 
 const yen = (n) => `¥${Math.abs(n).toLocaleString("ja-JP")}`;
-// JST基準で今日の日付を出す（UTCのまま計算すると深夜0〜9時頃に前日になってしまうため）
+// JST基準で今日の日付を出す（端末のタイムゾーン設定に関係なく、UTC時刻に常に9時間を足すだけの方式）
 const today = () => {
-  const d = new Date();
-  const jst = new Date(d.getTime() + (9 * 60 - d.getTimezoneOffset()) * 60000);
+  const jst = new Date(Date.now() + 9 * 60 * 60 * 1000);
   return jst.toISOString().slice(0, 10);
 };
 const fmtDate = (d) => {

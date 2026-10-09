@@ -11,5 +11,25 @@ service cloud.firestore {
                              && request.resource.data.keys().hasAll(['date', 'type', 'memo', 'amount']);
       allow delete: if false; // 削除は「deleted: true」への更新で行うため不要
     }
+
+    // ボール在庫データ：全員が閲覧可能。
+    // 作成・更新（使用記録の追加・購入連携・論理削除）は管理者のみ許可。
+    match /ballEntries/{entryId} {
+      allow read: if true;
+      allow create, update: if request.auth != null
+                             && request.auth.uid == 'D4ZDzT4bjlazjno8O0Xt93XujHo1'
+                             && request.resource.data.keys().hasAll(['date', 'kind', 'balls']);
+      allow delete: if false;
+    }
+
+    // ボール種類マスタ：全員が閲覧可能。
+    // 追加・名前変更・論理削除は管理者のみ許可。
+    match /ballTypes/{typeId} {
+      allow read: if true;
+      allow create, update: if request.auth != null
+                             && request.auth.uid == 'D4ZDzT4bjlazjno8O0Xt93XujHo1'
+                             && request.resource.data.keys().hasAll(['name']);
+      allow delete: if false;
+    }
   }
 }

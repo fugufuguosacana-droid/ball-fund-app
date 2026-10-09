@@ -11,7 +11,6 @@ import {
   X,
   Wallet,
   CircleDot,
-  Settings2,
 } from "lucide-react";
 import {
   collection,
@@ -31,7 +30,6 @@ import { db, auth } from "./firebase";
 
 const TX_COLLECTION = collection(db, "transactions");
 const BALL_COLLECTION = collection(db, "ballEntries");
-const TYPE_COLLECTION = collection(db, "ballTypes");
 const ADMIN_UID = "D4ZDzT4bjlazjno8O0Xt93XujHo1";
 
 const yen = (n) => `¥${Math.abs(n).toLocaleString("ja-JP")}`;
@@ -94,7 +92,6 @@ const styles = `
 .bft-ball-fields { background:#F7F8F6; border:1px solid #E7E9E4; border-radius:0.65rem; padding:0.75rem; margin-bottom:0.75rem; }
 .bft-row2 { display:flex; gap:0.5rem; }
 .bft-row2 > div { flex:1; }
-.bft-stock-row { display:flex; justify-content:space-between; align-items:baseline; padding:0.4rem 0; border-top:1px solid #EEF0EB; font-size:0.875rem; }
 `;
 
 export default function BallFundTracker() {
@@ -104,13 +101,6 @@ export default function BallFundTracker() {
   const [transactions, setTransactions] = useState([]);
   const [ballLoading, setBallLoading] = useState(true);
   const [ballEntries, setBallEntries] = useState([]);
-  const [ballTypes, setBallTypes] = useState([]); // 削除済みも含む（表示名の参照用）
-  const [showTypeModal, setShowTypeModal] = useState(false);
-  const [newTypeName, setNewTypeName] = useState("");
-  const [editingTypeId, setEditingTypeId] = useState(null);
-  const [editingTypeName, setEditingTypeName] = useState("");
-  const [typeSaving, setTypeSaving] = useState(false);
-  const [typeErrorMsg, setTypeErrorMsg] = useState("");
 
   const [user, setUser] = useState(null);
   const [authChecked, setAuthChecked] = useState(false);
@@ -127,7 +117,7 @@ export default function BallFundTracker() {
   const [formPrivateMemo, setFormPrivateMemo] = useState("");
   const [formAmount, setFormAmount] = useState("");
   const [formIsBallPurchase, setFormIsBallPurchase] = useState(false);
-  const [formBallTypeId, setFormBallTypeId] = useState("");
+  const [formBallType, setFormBallType] = useState("");
   const [formCans, setFormCans] = useState(1);
   const [formBallsPerCan, setFormBallsPerCan] = useState(4);
   const [saving, setSaving] = useState(false);
@@ -138,7 +128,6 @@ export default function BallFundTracker() {
   const [editingUseId, setEditingUseId] = useState(null);
   const [useDate, setUseDate] = useState(today());
   const [useBalls, setUseBalls] = useState(4);
-  const [useTypeId, setUseTypeId] = useState("");
   const [useMemo, setUseMemo] = useState("");
   const [ballSaving, setBallSaving] = useState(false);
   const [ballErrorMsg, setBallErrorMsg] = useState("");
@@ -159,13 +148,6 @@ export default function BallFundTracker() {
       .map((d) => ({ id: d.id, ...d.data() }))
       .filter((b) => !b.deleted);
     setBallEntries(list);
-  }, []);
-
-  const loadBallTypes = useCallback(async () => {
-    const snap = await getDocs(TYPE_COLLECTION);
-    const list = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
-    list.sort((a, b) => (a.createdAt?.seconds || 0) - (b.createdAt?.seconds || 0));
-    setBallTypes(list);
   }, []);
 
   useEffect(() => {
@@ -192,13 +174,13 @@ export default function BallFundTracker() {
     (async () => {
       setBallLoading(true);
       try {
-        await Promise.all([loadBallEntries(), loadBallTypes()]);
+        await loadBallEntries();
       } catch (e) {
         setBallErrorMsg(`読み込みに失敗しました（${e?.message || "不明なエラー"}）`);
       }
       setBallLoading(false);
     })();
-  }, [loadBallEntries, loadBallTypes]);
+  }, [loadBallEntries]);
 
   const balance = transactions.reduce(
     (sum, t) => sum + (t.type === "income" ? t.amount : -t.amount),
@@ -209,31 +191,6 @@ export default function BallFundTracker() {
     (sum, b) => sum + (b.kind === "purchase" ? b.balls : -b.balls),
     0
   );
-
-  const activeTypes = ballTypes.filter((t) => !t.deleted);
-  const typeById = (id) => ballTypes.find((t) => t.id === id);
-
-  // 在庫の集計キー：マスタID → なければ旧データの種類名 → なければ未指定
-  const entryKey = (b) =>
-    b.ballTypeId && typeById(b.ballTypeId)
-      ? b.ballTypeId
-      : b.ballType
-      ? `name:${b.ballType}`
-      : "none";
-  const entryTypeName = (b) =>
-    (b.ballTypeId && typeById(b.ballTypeId)?.name) || b.ballType || "種類未指定";
-
-  const stockByType = (() => {
-    const map = new Map();
-    activeTypes.forEach((t) => map.set(t.id, { key: t.id, name: t.name, qty: 0 }));
-    ballEntries.forEach((b) => {
-      const key = entryKey(b);
-      if (!map.has(key)) map.set(key, { key, name: entryTypeName(b), qty: 0 });
-      map.get(key).qty += b.kind === "purchase" ? b.balls : -b.balls;
-    });
-    // マスタ未登録かつ在庫0のもの（削除済み種類など）は表示しない
-    return [...map.values()].filter((r) => activeTypes.some((t) => t.id === r.key) || r.qty !== 0);
-  })();
 
   const handleSignIn = async () => {
     setAuthError("");
@@ -258,7 +215,7 @@ export default function BallFundTracker() {
     setFormPrivateMemo("");
     setFormAmount("");
     setFormIsBallPurchase(false);
-    setFormBallTypeId("");
+    setFormBallType("");
     setFormCans(1);
     setFormBallsPerCan(4);
     setErrorMsg("");
@@ -282,7 +239,7 @@ export default function BallFundTracker() {
       setFormParticipants(t.participants || Math.round(t.amount / 100) || 1);
       setFormAmount("");
       setFormIsBallPurchase(false);
-      setFormBallTypeId("");
+      setFormBallType("");
       setFormCans(1);
       setFormBallsPerCan(4);
       setEditingBallEntryId(null);
@@ -293,17 +250,13 @@ export default function BallFundTracker() {
       const linked = ballEntries.find((b) => b.sourceTxId === t.id);
       if (linked) {
         setFormIsBallPurchase(true);
-        setFormBallTypeId(
-          linked.ballTypeId && activeTypes.some((x) => x.id === linked.ballTypeId)
-            ? linked.ballTypeId
-            : activeTypes.find((x) => x.name === linked.ballType)?.id || ""
-        );
+        setFormBallType(linked.ballType || "");
         setFormCans(linked.cans || 1);
         setFormBallsPerCan(linked.ballsPerCan || 4);
         setEditingBallEntryId(linked.id);
       } else {
         setFormIsBallPurchase(false);
-        setFormBallTypeId("");
+        setFormBallType("");
         setFormCans(1);
         setFormBallsPerCan(4);
         setEditingBallEntryId(null);
@@ -332,8 +285,8 @@ export default function BallFundTracker() {
       return;
     }
     if (formType === "expense" && formIsBallPurchase) {
-      if (!formBallTypeId) {
-        setErrorMsg("ボールの種類を選択してください");
+      if (!formBallType.trim()) {
+        setErrorMsg("ボールの種類を入力してください");
         return;
       }
       if (!Number.isInteger(formCans) || formCans <= 0) {
@@ -376,8 +329,7 @@ export default function BallFundTracker() {
         const ballPayload = {
           date: formDate,
           kind: "purchase",
-          ballTypeId: formBallTypeId,
-          ballType: typeById(formBallTypeId)?.name || "",
+          ballType: formBallType.trim(),
           cans: formCans,
           ballsPerCan: formBallsPerCan,
           balls: computedBalls,
@@ -437,7 +389,6 @@ export default function BallFundTracker() {
   const resetBallUseForm = () => {
     setUseDate(today());
     setUseBalls(4);
-    setUseTypeId("");
     setUseMemo("");
     setBallErrorMsg("");
     setEditingUseId(null);
@@ -453,9 +404,6 @@ export default function BallFundTracker() {
     setEditingUseId(b.id);
     setUseDate(b.date);
     setUseBalls(b.balls);
-    setUseTypeId(
-      b.ballTypeId && activeTypes.some((x) => x.id === b.ballTypeId) ? b.ballTypeId : ""
-    );
     setUseMemo(b.memo || "");
     setShowBallUseForm(true);
   };
@@ -463,18 +411,12 @@ export default function BallFundTracker() {
   const handleSaveBallUse = async () => {
     setBallErrorMsg("");
     if (!Number.isInteger(useBalls) || useBalls <= 0) {
-      setBallErrorMsg("球数は1以上の整数で入力してください");
-      return;
-    }
-    if (!useTypeId) {
-      setBallErrorMsg("ボールの種類を選択してください");
+      setBallErrorMsg("本数は1以上の整数で入力してください");
       return;
     }
     const payload = {
       date: useDate,
       kind: "use",
-      ballTypeId: useTypeId,
-      ballType: typeById(useTypeId)?.name || "",
       balls: useBalls,
       memo: useMemo.trim(),
       sourceTxId: null,
@@ -498,81 +440,12 @@ export default function BallFundTracker() {
   };
 
   const handleDeleteBallUse = async (b) => {
-    if (!window.confirm(`この使用記録を削除しますか？\n${fmtDate(b.date)}「使用 ${b.balls}球」`)) return;
+    if (!window.confirm(`この使用記録を削除しますか？\n${fmtDate(b.date)}「使用 ${b.balls}本」`)) return;
     try {
       await updateDoc(doc(db, "ballEntries", b.id), { deleted: true });
       await loadBallEntries();
     } catch (e) {
       setBallErrorMsg(`削除に失敗しました（${e?.message || "不明なエラー"}）`);
-    }
-  };
-
-  // ---------- ボール種類マスタ ----------
-
-  const openTypeModal = () => {
-    setTypeErrorMsg("");
-    setNewTypeName("");
-    setEditingTypeId(null);
-    setShowTypeModal(true);
-  };
-
-  const handleAddType = async () => {
-    setTypeErrorMsg("");
-    const name = newTypeName.trim();
-    if (!name) {
-      setTypeErrorMsg("種類名を入力してください");
-      return;
-    }
-    if (activeTypes.some((t) => t.name === name)) {
-      setTypeErrorMsg("同じ名前の種類がすでにあります");
-      return;
-    }
-    setTypeSaving(true);
-    try {
-      await addDoc(TYPE_COLLECTION, { name, deleted: false, createdAt: serverTimestamp() });
-      setNewTypeName("");
-      await loadBallTypes();
-    } catch (e) {
-      setTypeErrorMsg(`保存に失敗しました（${e?.message || "不明なエラー"}）`);
-    } finally {
-      setTypeSaving(false);
-    }
-  };
-
-  const handleRenameType = async (t) => {
-    setTypeErrorMsg("");
-    const name = editingTypeName.trim();
-    if (!name) {
-      setTypeErrorMsg("種類名を入力してください");
-      return;
-    }
-    if (activeTypes.some((x) => x.id !== t.id && x.name === name)) {
-      setTypeErrorMsg("同じ名前の種類がすでにあります");
-      return;
-    }
-    setTypeSaving(true);
-    try {
-      await updateDoc(doc(db, "ballTypes", t.id), { name, deleted: false });
-      setEditingTypeId(null);
-      await loadBallTypes();
-    } catch (e) {
-      setTypeErrorMsg(`保存に失敗しました（${e?.message || "不明なエラー"}）`);
-    } finally {
-      setTypeSaving(false);
-    }
-  };
-
-  const handleDeleteType = async (t) => {
-    const used = ballEntries.some((b) => b.ballTypeId === t.id);
-    const msg = used
-      ? `「${t.name}」は過去の記録で使われています。\n削除しても過去の記録・在庫は残りますが、プルダウンには出なくなります。削除しますか？`
-      : `「${t.name}」を削除しますか？`;
-    if (!window.confirm(msg)) return;
-    try {
-      await updateDoc(doc(db, "ballTypes", t.id), { deleted: true });
-      await loadBallTypes();
-    } catch (e) {
-      setTypeErrorMsg(`削除に失敗しました（${e?.message || "不明なエラー"}）`);
     }
   };
 
@@ -711,54 +584,23 @@ export default function BallFundTracker() {
                   <span className="text-sm">読み込み中…</span>
                 </div>
               ) : (
-                <>
-                  <p
-                    className="font-mono text-4xl font-semibold tracking-tight"
-                    style={{ color: ballStock < 0 ? "#B15E2E" : "#4A7FB5" }}
-                  >
-                    {ballStock}
-                    <span className="text-lg ml-1">球</span>
-                  </p>
-                  {stockByType.length > 0 && (
-                    <div className="mt-4">
-                      <p className="bft-muted text-xs mb-1">種類別</p>
-                      {stockByType.map((r) => (
-                        <div key={r.key} className="bft-stock-row">
-                          <span>{r.name}</span>
-                          <span
-                            className="font-mono"
-                            style={{ color: r.qty < 0 ? "#B15E2E" : "#4A7FB5" }}
-                          >
-                            {r.qty}球
-                          </span>
-                        </div>
-                      ))}
-                    </div>
-                  )}
-                </>
-              )}
-              {isAdmin && (
-                <p className="bft-muted text-xs mt-3">
-                  購入は「残高」タブでボール購入として記帳すると自動で加算されます
+                <p
+                  className="font-mono text-4xl font-semibold tracking-tight"
+                  style={{ color: ballStock < 0 ? "#B15E2E" : "#4A7FB5" }}
+                >
+                  {ballStock}
+                  <span className="text-lg ml-1">本</span>
                 </p>
               )}
+              <p className="bft-muted text-xs mt-2">
+                購入は「残高」タブでボール購入として記帳すると自動で加算されます
+              </p>
             </div>
 
             {isAdmin && !ballLoading && (
               <button onClick={openBallUseForm} className="bft-btn-primary mb-6">
                 <Plus size={16} />
                 使用を記録（在庫を減らす）
-              </button>
-            )}
-
-            {isAdmin && !ballLoading && (
-              <button
-                onClick={openTypeModal}
-                className="bft-btn-outline mb-6"
-                style={{ width: "100%", flex: "none" }}
-              >
-                <Settings2 size={14} />
-                ボールの種類を管理
               </button>
             )}
 
@@ -782,8 +624,8 @@ export default function BallFundTracker() {
                       <div className="min-w-0">
                         <p className="text-sm truncate">
                           {b.kind === "purchase"
-                            ? `購入：${entryTypeName(b)}（${b.cans}缶×${b.ballsPerCan}球）`
-                            : `使用：${entryTypeName(b)}${b.memo ? `（${b.memo}）` : ""}`}
+                            ? `購入：${b.ballType}（${b.cans}缶×${b.ballsPerCan}球）`
+                            : `使用${b.memo ? `：${b.memo}` : ""}`}
                         </p>
                         <p className="bft-muted text-xs font-mono">{fmtDate(b.date)}</p>
                       </div>
@@ -794,7 +636,7 @@ export default function BallFundTracker() {
                         style={{ color: b.kind === "purchase" ? "#4A7FB5" : "#B15E2E" }}
                       >
                         {b.kind === "purchase" ? "+" : "−"}
-                        {b.balls}球
+                        {b.balls}本
                       </span>
                       {isAdmin && b.kind === "use" && (
                         <>
@@ -913,23 +755,13 @@ export default function BallFundTracker() {
               {formIsBallPurchase && (
                 <div className="bft-ball-fields">
                   <label className="bft-muted text-xs block mb-1">ボールの種類</label>
-                  <select
-                    value={formBallTypeId}
-                    onChange={(e) => setFormBallTypeId(e.target.value)}
+                  <input
+                    type="text"
+                    value={formBallType}
+                    onChange={(e) => setFormBallType(e.target.value)}
+                    placeholder="例：ダンロップ EXD"
                     className="bft-input mb-3"
-                  >
-                    <option value="">選択してください</option>
-                    {activeTypes.map((t) => (
-                      <option key={t.id} value={t.id}>
-                        {t.name}
-                      </option>
-                    ))}
-                  </select>
-                  {activeTypes.length === 0 && (
-                    <p className="bft-muted text-xs mb-3">
-                      先に「ボール残高」タブの「ボールの種類を管理」で種類を登録してください
-                    </p>
-                  )}
+                  />
                   <div className="bft-row2 mb-2">
                     <div>
                       <label className="bft-muted text-xs block mb-1">缶数</label>
@@ -955,7 +787,7 @@ export default function BallFundTracker() {
                     </div>
                   </div>
                   <p className="bft-muted text-xs font-mono">
-                    合計 <span style={{ color: "#4A7FB5" }}>{computedBalls}球</span> がボール在庫に加算されます
+                    合計 <span style={{ color: "#4A7FB5" }}>{computedBalls}本</span> がボール在庫に加算されます
                   </p>
                 </div>
               )}
@@ -982,72 +814,6 @@ export default function BallFundTracker() {
         </Modal>
       )}
 
-      {/* ボール種類マスタ管理モーダル */}
-      {showTypeModal && (
-        <Modal onClose={() => setShowTypeModal(false)}>
-          <h2 className="text-sm font-semibold mb-4">ボールの種類を管理</h2>
-
-          <ul className="mb-4">
-            {activeTypes.length === 0 && (
-              <li className="bft-muted text-xs py-2">まだ種類が登録されていません</li>
-            )}
-            {activeTypes.map((t) => (
-              <li key={t.id} className="bft-stock-row" style={{ alignItems: "center" }}>
-                {editingTypeId === t.id ? (
-                  <>
-                    <input
-                      type="text"
-                      value={editingTypeName}
-                      onChange={(e) => setEditingTypeName(e.target.value)}
-                      className="bft-input"
-                      style={{ marginRight: "0.5rem" }}
-                    />
-                    <button
-                      onClick={() => handleRenameType(t)}
-                      disabled={typeSaving}
-                      className="text-xs"
-                      style={{ color: "#6B8A2E", whiteSpace: "nowrap" }}
-                    >
-                      保存
-                    </button>
-                  </>
-                ) : (
-                  <>
-                    <span className="min-w-0 truncate">{t.name}</span>
-                    <span className="flex items-center gap-3 shrink-0">
-                      <button
-                        onClick={() => { setEditingTypeId(t.id); setEditingTypeName(t.name); setTypeErrorMsg(""); }}
-                        className="bft-delete-btn"
-                        aria-label="名前を変更"
-                      >
-                        <Pencil size={14} />
-                      </button>
-                      <button onClick={() => handleDeleteType(t)} className="bft-delete-btn" aria-label="削除">
-                        <Trash2 size={14} />
-                      </button>
-                    </span>
-                  </>
-                )}
-              </li>
-            ))}
-          </ul>
-
-          <label className="bft-muted text-xs block mb-1">新しい種類を追加</label>
-          <input
-            type="text"
-            value={newTypeName}
-            onChange={(e) => setNewTypeName(e.target.value)}
-            placeholder="例：ダンロップ フォート"
-            className="bft-input mb-3"
-          />
-          {typeErrorMsg && <p className="bft-error mb-2">{typeErrorMsg}</p>}
-          <button onClick={handleAddType} disabled={typeSaving} className="bft-btn-primary">
-            {typeSaving && <Loader2 size={14} className="animate-spin" />}
-            追加する
-          </button>
-        </Modal>
-      )}
-
       {/* ボール使用の記帳モーダル */}
       {showBallUseForm && (
         <Modal onClose={() => { setShowBallUseForm(false); resetBallUseForm(); }}>
@@ -1061,21 +827,7 @@ export default function BallFundTracker() {
             className="bft-input mb-3"
           />
 
-          <label className="bft-muted text-xs block mb-1">ボールの種類</label>
-          <select
-            value={useTypeId}
-            onChange={(e) => setUseTypeId(e.target.value)}
-            className="bft-input mb-3"
-          >
-            <option value="">選択してください</option>
-            {activeTypes.map((t) => (
-              <option key={t.id} value={t.id}>
-                {t.name}
-              </option>
-            ))}
-          </select>
-
-          <label className="bft-muted text-xs block mb-1">使用した球数</label>
+          <label className="bft-muted text-xs block mb-1">使用した本数</label>
           <input
             type="number"
             min={1}

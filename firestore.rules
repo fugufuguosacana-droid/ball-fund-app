@@ -31,5 +31,15 @@ service cloud.firestore {
                              && request.resource.data.keys().hasAll(['name']);
       allow delete: if false;
     }
+
+    // コートマスタ：全員が閲覧可能。
+    // 追加・名前変更・論理削除は管理者のみ許可。
+    match /courts/{courtId} {
+      allow read: if true;
+      allow create, update: if request.auth != null
+                             && request.auth.uid == 'D4ZDzT4bjlazjno8O0Xt93XujHo1'
+                             && request.resource.data.keys().hasAll(['name']);
+      allow delete: if false;
+    }
   }
 }

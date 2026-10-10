@@ -33,6 +33,7 @@ import { db, auth } from "./firebase";
 const TX_COLLECTION = collection(db, "transactions");
 const BALL_COLLECTION = collection(db, "ballEntries");
 const TYPE_COLLECTION = collection(db, "ballTypes");
+const COURT_COLLECTION = collection(db, "courts");
 const ADMIN_UID = "D4ZDzT4bjlazjno8O0Xt93XujHo1";
 
 const yen = (n) => `¥${Math.abs(n).toLocaleString("ja-JP")}`;
@@ -143,6 +144,12 @@ export default function BallFundTracker() {
   const [moneyMonthOpen, setMoneyMonthOpen] = useState({});
   const [ballMonthOpen, setBallMonthOpen] = useState({});
 
+  // コート（選択式マスタ）
+  const [courts, setCourts] = useState([]); // 削除済みも含む（表示名の参照用）
+  const [showCourtModal, setShowCourtModal] = useState(false);
+  const [courtSaving, setCourtSaving] = useState(false);
+  const [courtErrorMsg, setCourtErrorMsg] = useState("");
+
   const [user, setUser] = useState(null);
   const [authChecked, setAuthChecked] = useState(false);
   const [authError, setAuthError] = useState("");
@@ -161,6 +168,9 @@ export default function BallFundTracker() {
   const [formBallTypeId, setFormBallTypeId] = useState("");
   const [formCans, setFormCans] = useState(1);
   const [formBallsPerCan, setFormBallsPerCan] = useState(4);
+  const [formUnitPrice, setFormUnitPrice] = useState(100);
+  const [formCourtId, setFormCourtId] = useState("");
+  const [formActualAmount, setFormActualAmount] = useState("");
   const [saving, setSaving] = useState(false);
   const [errorMsg, setErrorMsg] = useState("");
 
@@ -171,6 +181,7 @@ export default function BallFundTracker() {
   const [useBalls, setUseBalls] = useState(4);
   const [useTypeId, setUseTypeId] = useState("");
   const [useMemo, setUseMemo] = useState("");
+  const [useCourtId, setUseCourtId] = useState("");
   const [ballSaving, setBallSaving] = useState(false);
   const [ballErrorMsg, setBallErrorMsg] = useState("");
 
@@ -197,6 +208,13 @@ export default function BallFundTracker() {
     const list = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
     list.sort((a, b) => (a.createdAt?.seconds || 0) - (b.createdAt?.seconds || 0));
     setBallTypes(list);
+  }, []);
+
+  const loadCourts = useCallback(async () => {
+    const snap = await getDocs(COURT_COLLECTION);
+    const list = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
+    list.sort((a, b) => (a.createdAt?.seconds || 0) - (b.createdAt?.seconds || 0));
+    setCourts(list);
   }, []);
 
   useEffect(() => {
@@ -231,6 +249,17 @@ export default function BallFundTracker() {
     })();
   }, [loadBallEntries, loadBallTypes]);
 
+  // コートは単独で読み込む（ルール未反映などで失敗しても、残高・在庫の表示は止めない）
+  useEffect(() => {
+    (async () => {
+      try {
+        await loadCourts();
+      } catch (e) {
+        console.warn("コート一覧の読み込みに失敗しました", e);
+      }
+    })();
+  }, [loadCourts]);
+
   const balance = transactions.reduce(
     (sum, t) => sum + (t.type === "income" ? t.amount : -t.amount),
     0
@@ -243,6 +272,17 @@ export default function BallFundTracker() {
 
   const activeTypes = ballTypes.filter((t) => !t.deleted);
   const typeById = (id) => ballTypes.find((t) => t.id === id);
+
+  const activeCourts = courts.filter((c) => !c.deleted);
+  const courtById = (id) => courts.find((c) => c.id === id);
+  const courtName = (x) => (x.courtId && courtById(x.courtId)?.name) || x.court || "";
+  // 選択肢：有効なコート＋（編集中の記録が使っている）削除済みコート
+  const courtOptionsFor = (selectedId) => [
+    ...activeCourts,
+    ...(selectedId && !activeCourts.some((c) => c.id === selectedId) && courtById(selectedId)
+      ? [courtById(selectedId)]
+      : []),
+  ];
 
   // 在庫の集計キー：マスタID → なければ旧データの種類名 → なければ未指定
   const entryKey = (b) =>
@@ -303,6 +343,9 @@ export default function BallFundTracker() {
     setFormBallTypeId("");
     setFormCans(1);
     setFormBallsPerCan(4);
+    setFormUnitPrice(100);
+    setFormCourtId("");
+    setFormActualAmount("");
     setErrorMsg("");
     setEditingId(null);
     setEditingBallEntryId(null);
@@ -320,6 +363,9 @@ export default function BallFundTracker() {
     setFormDate(t.date);
     setFormMemo(t.memo || "");
     setFormPrivateMemo(t.privateMemo || "");
+    setFormUnitPrice(t.unitPrice || 100);
+    setFormCourtId(t.courtId || "");
+    setFormActualAmount(t.privateActualAmount != null ? String(t.privateActualAmount) : "");
     if (t.type === "income") {
       setFormParticipants(t.participants || Math.round(t.amount / 100) || 1);
       setFormAmount("");
@@ -354,7 +400,7 @@ export default function BallFundTracker() {
     setShowForm(true);
   };
 
-  const computedIncomeAmount = formParticipants * 100;
+  const computedIncomeAmount = formParticipants * formUnitPrice;
   const computedBalls = formCans * formBallsPerCan;
 
   const handleAdd = async () => {
@@ -363,6 +409,10 @@ export default function BallFundTracker() {
 
     if (formType === "income" && !Number.isInteger(formParticipants)) {
       setErrorMsg("参加人数は整数で入力してください");
+      return;
+    }
+    if (formType === "income" && (!Number.isInteger(formUnitPrice) || formUnitPrice <= 0)) {
+      setErrorMsg("単価は1以上の整数で入力してください");
       return;
     }
     if (!amount || amount <= 0) {
@@ -388,6 +438,15 @@ export default function BallFundTracker() {
       }
     }
 
+    let actualAmount = null;
+    if (formType === "expense" && formActualAmount.trim() !== "") {
+      actualAmount = Number(formActualAmount);
+      if (!Number.isFinite(actualAmount) || actualAmount < 0) {
+        setErrorMsg("実質購入額は0以上の数値で入力してください");
+        return;
+      }
+    }
+
     const memo =
       formType === "income"
         ? formMemo.trim() || `練習日徴収（${formParticipants}人）`
@@ -400,6 +459,10 @@ export default function BallFundTracker() {
       privateMemo: formPrivateMemo.trim() || "",
       amount,
       participants: formType === "income" ? formParticipants : null,
+      unitPrice: formType === "income" ? formUnitPrice : null,
+      courtId: formType === "income" ? formCourtId || null : null,
+      court: formType === "income" ? courtById(formCourtId)?.name || "" : "",
+      privateActualAmount: formType === "expense" ? actualAmount : null,
       deleted: false,
     };
 
@@ -481,6 +544,7 @@ export default function BallFundTracker() {
     setUseBalls(4);
     setUseTypeId("");
     setUseMemo("");
+    setUseCourtId("");
     setBallErrorMsg("");
     setEditingUseId(null);
   };
@@ -499,6 +563,7 @@ export default function BallFundTracker() {
       b.ballTypeId && activeTypes.some((x) => x.id === b.ballTypeId) ? b.ballTypeId : ""
     );
     setUseMemo(b.memo || "");
+    setUseCourtId(b.courtId || "");
     setShowBallUseForm(true);
   };
 
@@ -527,6 +592,8 @@ export default function BallFundTracker() {
       ballType: typeById(useTypeId)?.name || "",
       balls: useBalls,
       memo: useMemo.trim(),
+      courtId: useCourtId || null,
+      court: courtById(useCourtId)?.name || "",
       sourceTxId: null,
       deleted: false,
     };
@@ -626,6 +693,77 @@ export default function BallFundTracker() {
     }
   };
 
+  // ---------- コートマスタ ----------
+
+  const openCourtModal = () => {
+    setCourtErrorMsg("");
+    setShowCourtModal(true);
+  };
+
+  // 追加・名前変更は成功したら true を返す（モーダル側の入力欄の後始末に使う）
+  const handleAddCourt = async (raw) => {
+    setCourtErrorMsg("");
+    const name = raw.trim();
+    if (!name) {
+      setCourtErrorMsg("コート名を入力してください");
+      return false;
+    }
+    if (activeCourts.some((c) => c.name === name)) {
+      setCourtErrorMsg("同じ名前のコートがすでにあります");
+      return false;
+    }
+    setCourtSaving(true);
+    try {
+      await addDoc(COURT_COLLECTION, { name, deleted: false, createdAt: serverTimestamp() });
+      await loadCourts();
+      return true;
+    } catch (e) {
+      setCourtErrorMsg(`保存に失敗しました（${e?.message || "不明なエラー"}）`);
+      return false;
+    } finally {
+      setCourtSaving(false);
+    }
+  };
+
+  const handleRenameCourt = async (c, raw) => {
+    setCourtErrorMsg("");
+    const name = raw.trim();
+    if (!name) {
+      setCourtErrorMsg("コート名を入力してください");
+      return false;
+    }
+    if (activeCourts.some((x) => x.id !== c.id && x.name === name)) {
+      setCourtErrorMsg("同じ名前のコートがすでにあります");
+      return false;
+    }
+    setCourtSaving(true);
+    try {
+      await updateDoc(doc(db, "courts", c.id), { name, deleted: false });
+      await loadCourts();
+      return true;
+    } catch (e) {
+      setCourtErrorMsg(`保存に失敗しました（${e?.message || "不明なエラー"}）`);
+      return false;
+    } finally {
+      setCourtSaving(false);
+    }
+  };
+
+  const handleDeleteCourt = async (c) => {
+    const used =
+      transactions.some((t) => t.courtId === c.id) || ballEntries.some((b) => b.courtId === c.id);
+    const msg = used
+      ? `「${c.name}」は過去の記録で使われています。\n削除しても過去の記録のコート名は残りますが、選択肢には出なくなります。削除しますか？`
+      : `「${c.name}」を削除しますか？`;
+    if (!window.confirm(msg)) return;
+    try {
+      await updateDoc(doc(db, "courts", c.id), { deleted: true });
+      await loadCourts();
+    } catch (e) {
+      setCourtErrorMsg(`削除に失敗しました（${e?.message || "不明なエラー"}）`);
+    }
+  };
+
   const sortedBallEntries = [...ballEntries].sort((a, b) => {
     if (a.date !== b.date) return a.date > b.date ? -1 : 1;
     const at = a.createdAt?.seconds || 0;
@@ -704,6 +842,17 @@ export default function BallFundTracker() {
               </button>
             )}
 
+            {isAdmin && !loading && (
+              <button
+                onClick={openCourtModal}
+                className="bft-btn-outline mb-6"
+                style={{ width: "100%", flex: "none" }}
+              >
+                <Settings2 size={14} />
+                コートを管理
+              </button>
+            )}
+
             <div className="mb-4">
               <p className="bft-muted text-xs mb-3 tracking-wide">履歴</p>
               {!loading && sorted.length === 0 && (
@@ -750,10 +899,18 @@ export default function BallFundTracker() {
                       />
                       <div className="min-w-0">
                         <p className="text-sm truncate">{t.memo}</p>
-                        <p className="bft-muted text-xs font-mono">{fmtDate(t.date)}</p>
+                        <p className="bft-muted text-xs font-mono">
+                          {fmtDate(t.date)}
+                          {courtName(t) ? ` ・${courtName(t)}` : ""}
+                        </p>
                         {isAdmin && t.privateMemo && (
                           <p className="text-xs mt-0.5 truncate" style={{ color: "#B15E2E" }}>
                             🔒 {t.privateMemo}
+                          </p>
+                        )}
+                        {isAdmin && t.privateActualAmount != null && (
+                          <p className="text-xs mt-0.5" style={{ color: "#B15E2E" }}>
+                            🔒 実質購入額 {yen(t.privateActualAmount)}
                           </p>
                         )}
                       </div>
@@ -899,7 +1056,10 @@ export default function BallFundTracker() {
                             ? `購入：${entryTypeName(b)}（${b.cans}缶×${b.ballsPerCan}球）`
                             : `使用：${entryTypeName(b)}${b.memo ? `（${b.memo}）` : ""}`}
                         </p>
-                        <p className="bft-muted text-xs font-mono">{fmtDate(b.date)}</p>
+                        <p className="bft-muted text-xs font-mono">
+                          {fmtDate(b.date)}
+                          {b.kind === "use" && courtName(b) ? ` ・${courtName(b)}` : ""}
+                        </p>
                       </div>
                     </div>
                     <div className="flex items-center gap-3 shrink-0">
@@ -979,19 +1139,54 @@ export default function BallFundTracker() {
 
           {formType === "income" ? (
             <>
-              <label className="bft-muted text-xs block mb-1">参加人数</label>
-              <input
-                type="number"
-                min={1}
-                step={1}
-                value={formParticipants}
-                onChange={(e) => setFormParticipants(Math.round(Number(e.target.value)))}
-                className="bft-input mb-3"
-              />
+              <div className="bft-row2 mb-3">
+                <div>
+                  <label className="bft-muted text-xs block mb-1">参加人数</label>
+                  <input
+                    type="number"
+                    min={1}
+                    step={1}
+                    value={formParticipants}
+                    onChange={(e) => setFormParticipants(Math.round(Number(e.target.value)))}
+                    className="bft-input"
+                  />
+                </div>
+                <div>
+                  <label className="bft-muted text-xs block mb-1">単価（円）</label>
+                  <input
+                    type="number"
+                    min={1}
+                    step={1}
+                    value={formUnitPrice}
+                    onChange={(e) => setFormUnitPrice(Math.round(Number(e.target.value)))}
+                    className="bft-input"
+                  />
+                </div>
+              </div>
               <p className="bft-muted text-xs mb-3 font-mono">
-                {formParticipants}人 × ¥100 ={" "}
+                {formParticipants}人 × {yen(formUnitPrice)} ={" "}
                 <span style={{ color: "#6B8A2E" }}>{yen(computedIncomeAmount)}</span>
               </p>
+
+              <label className="bft-muted text-xs block mb-1">コート（任意）</label>
+              <select
+                value={formCourtId}
+                onChange={(e) => setFormCourtId(e.target.value)}
+                className="bft-input mb-3"
+              >
+                <option value="">選択しない</option>
+                {courtOptionsFor(formCourtId).map((c) => (
+                  <option key={c.id} value={c.id}>
+                    {c.name}
+                    {c.deleted ? "（削除済み）" : ""}
+                  </option>
+                ))}
+              </select>
+              {activeCourts.length === 0 && (
+                <p className="bft-muted text-xs mb-3">
+                  「資金残高」タブの「コートを管理」でコートを登録すると、ここで選べます
+                </p>
+              )}
             </>
           ) : (
             <>
@@ -1092,6 +1287,22 @@ export default function BallFundTracker() {
             className="bft-input mb-3"
           />
 
+          {formType === "expense" && (
+            <>
+              <label className="bft-muted text-xs block mb-1">
+                実質購入額（管理者のみに表示・空欄でも可）
+              </label>
+              <input
+                type="number"
+                min={0}
+                value={formActualAmount}
+                onChange={(e) => setFormActualAmount(e.target.value)}
+                placeholder="例：2800（ポイント・割引後の支払額など）"
+                className="bft-input mb-3"
+              />
+            </>
+          )}
+
           {errorMsg && <p className="bft-error mb-2">{errorMsg}</p>}
 
           <button onClick={handleAdd} disabled={saving} className="bft-btn-primary">
@@ -1167,6 +1378,22 @@ export default function BallFundTracker() {
         </Modal>
       )}
 
+      {/* コートマスタ管理モーダル */}
+      {showCourtModal && (
+        <MasterListModal
+          title="コートを管理"
+          items={activeCourts}
+          placeholder="例：1番コート"
+          saving={courtSaving}
+          error={courtErrorMsg}
+          onClose={() => setShowCourtModal(false)}
+          onAdd={handleAddCourt}
+          onRename={handleRenameCourt}
+          onDelete={handleDeleteCourt}
+          onClearError={() => setCourtErrorMsg("")}
+        />
+      )}
+
       {/* ボール使用の記帳モーダル */}
       {showBallUseForm && (
         <Modal onClose={() => { setShowBallUseForm(false); resetBallUseForm(); }}>
@@ -1179,6 +1406,26 @@ export default function BallFundTracker() {
             onChange={(e) => setUseDate(e.target.value)}
             className="bft-input mb-3"
           />
+
+          <label className="bft-muted text-xs block mb-1">コート（任意）</label>
+          <select
+            value={useCourtId}
+            onChange={(e) => setUseCourtId(e.target.value)}
+            className="bft-input mb-3"
+          >
+            <option value="">選択しない</option>
+            {courtOptionsFor(useCourtId).map((c) => (
+              <option key={c.id} value={c.id}>
+                {c.name}
+                {c.deleted ? "（削除済み）" : ""}
+              </option>
+            ))}
+          </select>
+          {activeCourts.length === 0 && (
+            <p className="bft-muted text-xs mb-3">
+              「資金残高」タブの「コートを管理」でコートを登録すると、ここで選べます
+            </p>
+          )}
 
           <label className="bft-muted text-xs block mb-1">ボールの種類</label>
           <select
@@ -1232,6 +1479,99 @@ export default function BallFundTracker() {
         </Modal>
       )}
     </div>
+  );
+}
+
+// 名前だけを持つ選択肢マスタ（コートなど）の追加・名前変更・削除モーダル
+function MasterListModal({
+  title,
+  items,
+  placeholder,
+  saving,
+  error,
+  onClose,
+  onAdd,
+  onRename,
+  onDelete,
+  onClearError,
+}) {
+  const [newName, setNewName] = useState("");
+  const [editingId, setEditingId] = useState(null);
+  const [editingName, setEditingName] = useState("");
+
+  return (
+    <Modal onClose={onClose}>
+      <h2 className="text-sm font-semibold mb-4">{title}</h2>
+
+      <ul className="mb-4">
+        {items.length === 0 && <li className="bft-muted text-xs py-2">まだ登録されていません</li>}
+        {items.map((t) => (
+          <li key={t.id} className="bft-stock-row" style={{ alignItems: "center" }}>
+            {editingId === t.id ? (
+              <>
+                <input
+                  type="text"
+                  value={editingName}
+                  onChange={(e) => setEditingName(e.target.value)}
+                  className="bft-input"
+                  style={{ marginRight: "0.5rem" }}
+                />
+                <button
+                  onClick={async () => {
+                    if (await onRename(t, editingName)) setEditingId(null);
+                  }}
+                  disabled={saving}
+                  className="text-xs"
+                  style={{ color: "#6B8A2E", whiteSpace: "nowrap" }}
+                >
+                  保存
+                </button>
+              </>
+            ) : (
+              <>
+                <span className="min-w-0 truncate">{t.name}</span>
+                <span className="flex items-center gap-3 shrink-0">
+                  <button
+                    onClick={() => {
+                      setEditingId(t.id);
+                      setEditingName(t.name);
+                      onClearError();
+                    }}
+                    className="bft-delete-btn"
+                    aria-label="名前を変更"
+                  >
+                    <Pencil size={14} />
+                  </button>
+                  <button onClick={() => onDelete(t)} className="bft-delete-btn" aria-label="削除">
+                    <Trash2 size={14} />
+                  </button>
+                </span>
+              </>
+            )}
+          </li>
+        ))}
+      </ul>
+
+      <label className="bft-muted text-xs block mb-1">新しく追加</label>
+      <input
+        type="text"
+        value={newName}
+        onChange={(e) => setNewName(e.target.value)}
+        placeholder={placeholder}
+        className="bft-input mb-3"
+      />
+      {error && <p className="bft-error mb-2">{error}</p>}
+      <button
+        onClick={async () => {
+          if (await onAdd(newName)) setNewName("");
+        }}
+        disabled={saving}
+        className="bft-btn-primary"
+      >
+        {saving && <Loader2 size={14} className="animate-spin" />}
+        追加する
+      </button>
+    </Modal>
   );
 }
 

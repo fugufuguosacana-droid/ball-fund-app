@@ -12,6 +12,7 @@ import {
   Wallet,
   CircleDot,
   Settings2,
+  ChevronDown,
 } from "lucide-react";
 import {
   collection,
@@ -43,6 +44,25 @@ const today = () => {
 const fmtDate = (d) => {
   const dt = new Date(d + "T00:00:00");
   return `${dt.getMonth() + 1}/${dt.getDate()}`;
+};
+// 履歴を月ごとにまとめる（日付の新しい順に並んだリストを渡す前提）
+const monthKey = (d) => (d || "").slice(0, 7);
+const monthLabel = (k) => {
+  const [y, m] = k.split("-");
+  return `${y}年${Number(m)}月`;
+};
+const groupByMonth = (list) => {
+  const groups = [];
+  list.forEach((item) => {
+    const k = monthKey(item.date);
+    let g = groups[groups.length - 1];
+    if (!g || g.key !== k) {
+      g = { key: k, items: [] };
+      groups.push(g);
+    }
+    g.items.push(item);
+  });
+  return groups;
 };
 
 const styles = `
@@ -95,6 +115,13 @@ const styles = `
 .bft-row2 { display:flex; gap:0.5rem; }
 .bft-row2 > div { flex:1; }
 .bft-stock-row { display:flex; justify-content:space-between; align-items:baseline; padding:0.4rem 0; border-top:1px solid #EEF0EB; font-size:0.875rem; }
+.bft-month-head {
+  width:100%; display:flex; align-items:center; justify-content:space-between; gap:0.5rem;
+  padding:0.5rem 0.25rem; margin-bottom:0.25rem; background:none; border:none;
+  cursor:pointer; color:#2B2E2C; font-size:0.8rem;
+}
+.bft-month-head .chev { color:#8A8F87; transition:transform 0.15s; }
+.bft-month-head.closed .chev { transform:rotate(-90deg); }
 `;
 
 export default function BallFundTracker() {
@@ -111,6 +138,10 @@ export default function BallFundTracker() {
   const [editingTypeName, setEditingTypeName] = useState("");
   const [typeSaving, setTypeSaving] = useState(false);
   const [typeErrorMsg, setTypeErrorMsg] = useState("");
+
+  // 月ごとの開閉状態（キー：YYYY-MM。未設定なら最新の月だけ開く）
+  const [moneyMonthOpen, setMoneyMonthOpen] = useState({});
+  const [ballMonthOpen, setBallMonthOpen] = useState({});
 
   const [user, setUser] = useState(null);
   const [authChecked, setAuthChecked] = useState(false);
@@ -231,9 +262,20 @@ export default function BallFundTracker() {
       if (!map.has(key)) map.set(key, { key, name: entryTypeName(b), qty: 0 });
       map.get(key).qty += b.kind === "purchase" ? b.balls : -b.balls;
     });
-    // マスタ未登録かつ在庫0のもの（削除済み種類など）は表示しない
-    return [...map.values()].filter((r) => activeTypes.some((t) => t.id === r.key) || r.qty !== 0);
+    // 在庫0の種類は表示しない（マイナスは異常のため残す）
+    return [...map.values()].filter((r) => r.qty !== 0);
   })();
+
+  // 指定した種類の在庫（編集中の使用記録は除いて数える）
+  const stockOfType = (typeId, excludeEntryId) =>
+    ballEntries
+      .filter((b) => b.id !== excludeEntryId && entryKey(b) === typeId)
+      .reduce((sum, b) => sum + (b.kind === "purchase" ? b.balls : -b.balls), 0);
+
+  // 使用フォームの在庫プレビュー（種類未選択のときは null）
+  const useStockBefore = useTypeId ? stockOfType(useTypeId, editingUseId) : null;
+  const useStockAfter =
+    useStockBefore === null ? null : useStockBefore - (Number.isInteger(useBalls) ? useBalls : 0);
 
   const handleSignIn = async () => {
     setAuthError("");
@@ -470,6 +512,14 @@ export default function BallFundTracker() {
       setBallErrorMsg("ボールの種類を選択してください");
       return;
     }
+    // 在庫を超える使用は、確認のうえで記録できる（禁止はしない）
+    if (useStockAfter !== null && useStockAfter < 0) {
+      const name = typeById(useTypeId)?.name || "この種類";
+      const ok = window.confirm(
+        `「${name}」の在庫は${useStockBefore}球ですが、${useBalls}球を使用すると${useStockAfter}球（マイナス）になります。\nこのまま記録しますか？`
+      );
+      if (!ok) return;
+    }
     const payload = {
       date: useDate,
       kind: "use",
@@ -583,6 +633,9 @@ export default function BallFundTracker() {
     return bt - at;
   });
 
+  const moneyGroups = groupByMonth(sorted);
+  const ballGroups = groupByMonth(sortedBallEntries);
+
   return (
     <div className="bft-page">
       <style>{styles}</style>
@@ -590,7 +643,7 @@ export default function BallFundTracker() {
         <div className="flex items-start justify-between mb-6">
           <div>
             <p className="bft-muted text-xs tracking-widest uppercase mb-1">Circle Ball Fund</p>
-            <h1 className="text-lg font-semibold">ボール代 残高表</h1>
+            <h1 className="text-lg font-semibold">ボール/ボール代 残高表</h1>
           </div>
           {authChecked && (
             <button
@@ -613,7 +666,7 @@ export default function BallFundTracker() {
             onClick={() => setActiveTab("money")}
           >
             <Wallet size={14} />
-            残高
+            資金残高
           </button>
           <button
             className={`bft-tab ${activeTab === "balls" ? "active" : ""}`}
@@ -627,7 +680,7 @@ export default function BallFundTracker() {
         {activeTab === "money" ? (
           <>
             <div className="bft-card px-6 py-7 mb-6">
-              <p className="bft-muted text-xs mb-2">現在の残高</p>
+              <p className="bft-muted text-xs mb-2">現在の資金残高</p>
               {loading ? (
                 <div className="flex items-center gap-2 bft-muted">
                   <Loader2 size={18} className="animate-spin" />
@@ -659,8 +712,36 @@ export default function BallFundTracker() {
                   {isAdmin ? "最初の徴収を記帳しましょう。" : "記録が増えるとここに表示されます。"}
                 </div>
               )}
-              <ul className="space-y-2">
-                {sorted.map((t) => (
+              <div className="space-y-3">
+                {moneyGroups.map((g, gi) => {
+                  const open = moneyMonthOpen[g.key] ?? gi === 0;
+                  const net = g.items.reduce(
+                    (s, t) => s + (t.type === "income" ? t.amount : -t.amount),
+                    0
+                  );
+                  return (
+                    <div key={g.key}>
+                      <button
+                        className={`bft-month-head ${open ? "" : "closed"}`}
+                        onClick={() => setMoneyMonthOpen((m) => ({ ...m, [g.key]: !open }))}
+                        aria-expanded={open}
+                      >
+                        <span className="flex items-center gap-1.5">
+                          <ChevronDown size={14} className="chev" />
+                          <span className="font-medium">{monthLabel(g.key)}</span>
+                          <span className="bft-muted text-xs">{g.items.length}件</span>
+                        </span>
+                        <span
+                          className="font-mono text-xs"
+                          style={{ color: net < 0 ? "#B15E2E" : "#6B8A2E" }}
+                        >
+                          {net < 0 ? "−" : "+"}
+                          {yen(net)}
+                        </span>
+                      </button>
+                      {open && (
+                        <ul className="space-y-2">
+                          {g.items.map((t) => (
                   <li key={t.id} className="bft-card flex items-center justify-between px-4 py-3">
                     <div className="flex items-center gap-3 min-w-0">
                       <span
@@ -697,8 +778,13 @@ export default function BallFundTracker() {
                       )}
                     </div>
                   </li>
-                ))}
-              </ul>
+                          ))}
+                        </ul>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
             </div>
           </>
         ) : (
@@ -739,7 +825,7 @@ export default function BallFundTracker() {
               )}
               {isAdmin && (
                 <p className="bft-muted text-xs mt-3">
-                  購入は「残高」タブでボール購入として記帳すると自動で加算されます
+                  購入は「資金残高」タブでボール購入として記帳すると自動で加算されます
                 </p>
               )}
             </div>
@@ -771,8 +857,36 @@ export default function BallFundTracker() {
                   まだ記録がありません。
                 </div>
               )}
-              <ul className="space-y-2">
-                {sortedBallEntries.map((b) => (
+              <div className="space-y-3">
+                {ballGroups.map((g, gi) => {
+                  const open = ballMonthOpen[g.key] ?? gi === 0;
+                  const net = g.items.reduce(
+                    (s, b) => s + (b.kind === "purchase" ? b.balls : -b.balls),
+                    0
+                  );
+                  return (
+                    <div key={g.key}>
+                      <button
+                        className={`bft-month-head ${open ? "" : "closed"}`}
+                        onClick={() => setBallMonthOpen((m) => ({ ...m, [g.key]: !open }))}
+                        aria-expanded={open}
+                      >
+                        <span className="flex items-center gap-1.5">
+                          <ChevronDown size={14} className="chev" />
+                          <span className="font-medium">{monthLabel(g.key)}</span>
+                          <span className="bft-muted text-xs">{g.items.length}件</span>
+                        </span>
+                        <span
+                          className="font-mono text-xs"
+                          style={{ color: net < 0 ? "#B15E2E" : "#4A7FB5" }}
+                        >
+                          {net < 0 ? "−" : "+"}
+                          {Math.abs(net)}球
+                        </span>
+                      </button>
+                      {open && (
+                        <ul className="space-y-2">
+                          {g.items.map((b) => (
                   <li key={b.id} className="bft-card flex items-center justify-between px-4 py-3">
                     <div className="flex items-center gap-3 min-w-0">
                       <span
@@ -808,13 +922,18 @@ export default function BallFundTracker() {
                       )}
                       {isAdmin && b.kind === "purchase" && (
                         <span className="bft-muted-light" style={{ fontSize: "10px" }}>
-                          残高タブで編集
+                          資金残高タブで編集
                         </span>
                       )}
                     </div>
                   </li>
-                ))}
-              </ul>
+                          ))}
+                        </ul>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
             </div>
           </>
         )}
@@ -1084,6 +1203,16 @@ export default function BallFundTracker() {
             onChange={(e) => setUseBalls(Math.round(Number(e.target.value)))}
             className="bft-input mb-3"
           />
+
+          {useStockAfter !== null && (
+            <p
+              className="text-xs mb-3 font-mono"
+              style={{ color: useStockAfter < 0 ? "#C0392B" : "#8A8F87" }}
+            >
+              在庫 {useStockBefore}球 → 記録後 {useStockAfter}球
+              {useStockAfter < 0 && "（在庫が足りません）"}
+            </p>
+          )}
 
           <label className="bft-muted text-xs block mb-1">メモ（空欄でも可）</label>
           <input

@@ -191,6 +191,8 @@ export default function BallFundTracker() {
   const [formIsBallPurchase, setFormIsBallPurchase] = useState(false);
   const [formBallTypeId, setFormBallTypeId] = useState("");
   const [formCans, setFormCans] = useState(1);
+  const [formIsPersonal, setFormIsPersonal] = useState(false); // 参加者私物（在庫には反映しない）
+  const [formPersonalBalls, setFormPersonalBalls] = useState(4); // 私物の球数
   const [formBallsPerCan, setFormBallsPerCan] = useState(4);
   const [formUnitPrice, setFormUnitPrice] = useState(100);
   const [formCourtId, setFormCourtId] = useState("");
@@ -198,7 +200,7 @@ export default function BallFundTracker() {
   const [saving, setSaving] = useState(false);
   const [errorMsg, setErrorMsg] = useState("");
 
-  // --- ボール使用フォーム（ボール残高タブ） ---
+  // --- ボール使用フォーム（ボール在庫タブ） ---
   const [showBallUseForm, setShowBallUseForm] = useState(false);
   const [editingUseId, setEditingUseId] = useState(null);
   const [useDate, setUseDate] = useState(today());
@@ -244,25 +246,31 @@ export default function BallFundTracker() {
 
   // 非公開データ（管理者のみ）。失敗しても例外は投げず、画面にエラーを出す
   const loadPrivate = useCallback(async () => {
+    // メンバーと非公開詳細は別々に読む（片方が失敗しても、もう片方は表示できるようにする）
+    const errors = [];
     try {
-      const [pSnap, mSnap] = await Promise.all([
-        getDocs(PRIVATE_COLLECTION),
-        getDocs(MEMBER_COLLECTION),
-      ]);
+      const mSnap = await getDocs(MEMBER_COLLECTION);
+      const list = mSnap.docs.map((d) => ({ id: d.id, ...d.data() }));
+      list.sort(sortMasters);
+      setMembers(list);
+    } catch (e) {
+      errors.push(`メンバー（members）：${e?.message || "不明なエラー"}`);
+    }
+    try {
+      const pSnap = await getDocs(PRIVATE_COLLECTION);
       const map = {};
       pSnap.docs.forEach((d) => {
         map[d.id] = d.data();
       });
       setPrivateMap(map);
-      const list = mSnap.docs.map((d) => ({ id: d.id, ...d.data() }));
-      list.sort(sortMasters);
-      setMembers(list);
-      setPrivateError("");
     } catch (e) {
-      setPrivateError(
-        `非公開データの読み込みに失敗しました（${e?.message || "不明なエラー"}）。firestore.rules を反映済みか確認してください`
-      );
+      errors.push(`非公開詳細（privateDetails）：${e?.message || "不明なエラー"}`);
     }
+    setPrivateError(
+      errors.length
+        ? `非公開データの読み込みに失敗しました。${errors.join(" / ")}。firestore.rules を反映済みか確認してください`
+        : ""
+    );
   }, []);
 
   useEffect(() => {
@@ -342,6 +350,24 @@ export default function BallFundTracker() {
       ? [courtById(selectedId)]
       : []),
   ];
+
+  // 旧デフォルト表記「練習日徴収（x人）」は表示だけ新表記に読み替える（保存データは変えない）
+  const displayMemo = (memo) => (memo || "").replace(/^練習日徴収（(\d+)人）$/, "参加者からの集金（$1人）");
+
+  // メンバーごとの集金累計（参加者を記録した徴収のみ。1人あたり＝その回の単価）
+  const memberTotals = {};
+  transactions.forEach((t) => {
+    if (t.deleted || t.type !== "income") return;
+    const ids = privateMap[t.id]?.participantIds || [];
+    if (ids.length === 0) return;
+    const per = t.unitPrice || (t.participants ? Math.round(t.amount / t.participants) : 0);
+    ids.forEach((id) => {
+      const cur = memberTotals[id] || { total: 0, count: 0 };
+      cur.total += per;
+      cur.count += 1;
+      memberTotals[id] = cur;
+    });
+  });
 
   const activeMembers = members.filter((m) => !m.deleted);
   const memberById = (id) => members.find((m) => m.id === id);
@@ -427,6 +453,8 @@ export default function BallFundTracker() {
     setFormPrivateMemo("");
     setFormAmount("");
     setFormIsBallPurchase(false);
+    setFormIsPersonal(false);
+    setFormPersonalBalls(4);
     setFormBallTypeId("");
     setFormCans(1);
     setFormBallsPerCan(4);
@@ -450,7 +478,10 @@ export default function BallFundTracker() {
     setFormType(t.type);
     setFormDate(t.date);
     setFormMemo(t.memo || "");
-    setFormPrivateMemo(pv.memo);
+    // 購入の摘要は非公開になったため、旧データの公開摘要（自動表記でないもの）は非公開メモ側に引き継ぐ
+    const legacyMemo =
+      t.type === "expense" && t.memo && t.memo !== "購入" && !/ x \d+球? 購入(（参加者私物）)?$/.test(t.memo) ? t.memo : "";
+    setFormPrivateMemo([legacyMemo, pv.memo].filter(Boolean).join(" / "));
     setFormUnitPrice(t.unitPrice || 100);
     setFormCourtId(t.courtId || "");
     setFormActualAmount(pv.actual != null ? String(pv.actual) : "");
@@ -478,11 +509,16 @@ export default function BallFundTracker() {
         setFormCans(linked.cans || 1);
         setFormBallsPerCan(linked.ballsPerCan || 4);
         setEditingBallEntryId(linked.id);
+        setFormIsPersonal(false);
       } else {
         setFormIsBallPurchase(false);
-        setFormBallTypeId("");
+        setFormIsPersonal(!!t.personal);
+        setFormBallTypeId(
+          t.personal && t.ballTypeId && activeTypes.some((x) => x.id === t.ballTypeId) ? t.ballTypeId : ""
+        );
         setFormCans(1);
         setFormBallsPerCan(4);
+        setFormPersonalBalls(t.personal ? t.balls || 4 : 4);
         setEditingBallEntryId(null);
       }
     }
@@ -517,9 +553,15 @@ export default function BallFundTracker() {
       setErrorMsg("金額を正しく入力してください");
       return;
     }
-    if (formType === "expense" && !formMemo.trim()) {
-      setErrorMsg("購入内容を入力してください");
-      return;
+    if (formType === "expense" && formIsPersonal) {
+      if (!formBallTypeId) {
+        setErrorMsg("ボールの種類を選択してください");
+        return;
+      }
+      if (!Number.isInteger(formPersonalBalls) || formPersonalBalls <= 0) {
+        setErrorMsg("球数は1以上の整数で入力してください");
+        return;
+      }
     }
     if (formType === "expense" && formIsBallPurchase) {
       if (!formBallTypeId) {
@@ -530,7 +572,7 @@ export default function BallFundTracker() {
         setErrorMsg("缶数は1以上の整数で入力してください");
         return;
       }
-      if (!Number.isInteger(formBallsPerCan) || formBallsPerCan <= 0) {
+      if (formIsBallPurchase && (!Number.isInteger(formBallsPerCan) || formBallsPerCan <= 0)) {
         setErrorMsg("1缶あたりの球数は1以上の整数で入力してください");
         return;
       }
@@ -547,8 +589,12 @@ export default function BallFundTracker() {
 
     const memo =
       formType === "income"
-        ? formMemo.trim() || `練習日徴収（${formParticipants}人）`
-        : formMemo.trim();
+        ? formMemo.trim() || `参加者からの集金（${formParticipants}人）`
+        : formIsBallPurchase
+          ? `${typeById(formBallTypeId)?.name || "ボール"} x ${computedBalls}球 購入`
+          : formIsPersonal
+            ? `${typeById(formBallTypeId)?.name || "ボール"} x ${formPersonalBalls}球 購入（参加者私物）`
+            : "購入";
 
     // 公開側に保存する項目（非公開メモ・実質購入額・参加者は含めない）
     const payload = {
@@ -560,6 +606,11 @@ export default function BallFundTracker() {
       unitPrice: formType === "income" ? formUnitPrice : null,
       courtId: formType === "income" ? formCourtId || null : null,
       court: formType === "income" ? courtById(formCourtId)?.name || "" : "",
+      // 参加者私物（在庫には反映しない。種類と缶数だけ記録する）
+      personal: formType === "expense" && formIsPersonal,
+      ballTypeId: formType === "expense" && formIsPersonal ? formBallTypeId : null,
+      ballType: formType === "expense" && formIsPersonal ? typeById(formBallTypeId)?.name || "" : "",
+      balls: formType === "expense" && formIsPersonal ? formPersonalBalls : null,
       deleted: false,
     };
 
@@ -624,7 +675,7 @@ export default function BallFundTracker() {
   };
 
   const handleDelete = async (t) => {
-    const label = `${fmtDate(t.date)}「${t.memo}」（${t.type === "income" ? "+" : "−"}${yen(t.amount)}）`;
+    const label = `${fmtDate(t.date)}「${displayMemo(t.memo)}」（${t.type === "income" ? "+" : "−"}${yen(t.amount)}）`;
     if (!window.confirm(`この記帳を削除しますか？\n${label}`)) return;
     try {
       await updateDoc(doc(db, "transactions", t.id), {
@@ -699,7 +750,7 @@ export default function BallFundTracker() {
     }
   };
 
-  // ---------- ボール使用フォーム（ボール残高タブ） ----------
+  // ---------- ボール使用フォーム（ボール在庫タブ） ----------
 
   const resetBallUseForm = () => {
     setUseDate(today());
@@ -831,6 +882,10 @@ export default function BallFundTracker() {
       title: "メンバーを管理（管理者のみ表示）",
       coll: "members",
       items: activeMembers,
+      valueOf: (m) => {
+        const v = memberTotals[m.id] || { total: 0, count: 0 };
+        return `${yen(v.total)}（${v.count}回）`;
+      },
       reload: loadPrivate,
       placeholder: "例：ニックネーム",
       deleteMessage: (m) =>
@@ -984,7 +1039,7 @@ export default function BallFundTracker() {
             onClick={() => setActiveTab("balls")}
           >
             <CircleDot size={14} />
-            ボール残高
+            ボール在庫
           </button>
         </div>
 
@@ -1080,7 +1135,7 @@ export default function BallFundTracker() {
                                     style={{ backgroundColor: t.type === "income" ? "#8FAE3E" : "#C97B4A" }}
                                   />
                                   <div className="min-w-0">
-                                    <p className="text-sm truncate">{t.memo}</p>
+                                    <p className="text-sm truncate">{displayMemo(t.memo)}</p>
                                     <p className="bft-muted text-xs font-mono">
                                       {fmtDate(t.date)}
                                       {courtName(t) ? ` ・${courtName(t)}` : ""}
@@ -1157,7 +1212,7 @@ export default function BallFundTracker() {
         ) : (
           <>
             <div className="bft-card px-6 py-7 mb-6">
-              <p className="bft-muted text-xs mb-2">現在のボール在庫</p>
+              <p className="bft-muted text-xs mb-2">現在のニューボール在庫</p>
               {ballLoading ? (
                 <div className="flex items-center gap-2 bft-muted">
                   <Loader2 size={18} className="animate-spin" />
@@ -1450,16 +1505,23 @@ export default function BallFundTracker() {
             </>
           )}
 
-          <label className="bft-muted text-xs block mb-1">
-            摘要{formType === "income" ? "（空欄でも可）" : ""}
-          </label>
-          <input
-            type="text"
-            value={formMemo}
-            onChange={(e) => setFormMemo(e.target.value)}
-            placeholder={formType === "income" ? "例：8/3練習分" : "例：テニスボール4缶購入"}
-            className="bft-input mb-3"
-          />
+          {formType === "income" && (
+            <>
+              <label className="bft-muted text-xs block mb-1">摘要（空欄でも可）</label>
+              <input
+                type="text"
+                value={formMemo}
+                onChange={(e) => setFormMemo(e.target.value)}
+                placeholder="例：8/3練習分"
+                className="bft-input mb-3"
+              />
+            </>
+          )}
+          {formType === "expense" && (
+            <p className="bft-muted text-xs mb-3">
+              公開される摘要は自動で付きます（例：ダンロップHD x 1 購入）。詳細は下の摘要欄（管理者のみ表示）に書けます。
+            </p>
+          )}
 
           {formType === "expense" && (
             <>
@@ -1467,12 +1529,26 @@ export default function BallFundTracker() {
                 <input
                   type="checkbox"
                   checked={formIsBallPurchase}
-                  onChange={(e) => setFormIsBallPurchase(e.target.checked)}
+                  onChange={(e) => {
+                    setFormIsBallPurchase(e.target.checked);
+                    if (e.target.checked) setFormIsPersonal(false);
+                  }}
                 />
                 <span className="text-xs">この購入はボール代（在庫に反映する）</span>
               </label>
+              <label className="bft-checkbox-row">
+                <input
+                  type="checkbox"
+                  checked={formIsPersonal}
+                  onChange={(e) => {
+                    setFormIsPersonal(e.target.checked);
+                    if (e.target.checked) setFormIsBallPurchase(false);
+                  }}
+                />
+                <span className="text-xs">参加者私物（在庫には反映しない）</span>
+              </label>
 
-              {formIsBallPurchase && (
+              {(formIsBallPurchase || formIsPersonal) && (
                 <div className="bft-ball-fields">
                   <label className="bft-muted text-xs block mb-1">ボールの種類</label>
                   <select
@@ -1489,49 +1565,67 @@ export default function BallFundTracker() {
                   </select>
                   {activeTypes.length === 0 && (
                     <p className="bft-muted text-xs mb-3">
-                      先に「ボール残高」タブの「ボールの種類を管理」で種類を登録してください
+                      先に「ボール在庫」タブの「ボールの種類を管理」で種類を登録してください
                     </p>
                   )}
-                  <div className="bft-row2 mb-2">
-                    <div>
-                      <label className="bft-muted text-xs block mb-1">缶数</label>
+                  {formIsBallPurchase && (
+                    <>
+                      <div className="bft-row2 mb-2">
+                        <div>
+                          <label className="bft-muted text-xs block mb-1">缶数</label>
+                          <input
+                            type="number"
+                            min={1}
+                            step={1}
+                            value={formCans}
+                            onChange={(e) => setFormCans(Math.round(Number(e.target.value)))}
+                            className="bft-input"
+                          />
+                        </div>
+                        <div>
+                          <label className="bft-muted text-xs block mb-1">1缶あたりの球数</label>
+                          <input
+                            type="number"
+                            min={1}
+                            step={1}
+                            value={formBallsPerCan}
+                            onChange={(e) => setFormBallsPerCan(Math.round(Number(e.target.value)))}
+                            className="bft-input"
+                          />
+                        </div>
+                      </div>
+                      <p className="bft-muted text-xs font-mono">
+                        合計 <span style={{ color: "#4A7FB5" }}>{computedBalls}球</span> がボール在庫に加算されます
+                      </p>
+                    </>
+                  )}
+                  {formIsPersonal && (
+                    <>
+                      <label className="bft-muted text-xs block mb-1">球数</label>
                       <input
                         type="number"
                         min={1}
                         step={1}
-                        value={formCans}
-                        onChange={(e) => setFormCans(Math.round(Number(e.target.value)))}
-                        className="bft-input"
+                        value={formPersonalBalls}
+                        onChange={(e) => setFormPersonalBalls(Math.round(Number(e.target.value)))}
+                        className="bft-input mb-2"
                       />
-                    </div>
-                    <div>
-                      <label className="bft-muted text-xs block mb-1">1缶あたりの球数</label>
-                      <input
-                        type="number"
-                        min={1}
-                        step={1}
-                        value={formBallsPerCan}
-                        onChange={(e) => setFormBallsPerCan(Math.round(Number(e.target.value)))}
-                        className="bft-input"
-                      />
-                    </div>
-                  </div>
-                  <p className="bft-muted text-xs font-mono">
-                    合計 <span style={{ color: "#4A7FB5" }}>{computedBalls}球</span> がボール在庫に加算されます
-                  </p>
+                      <p className="bft-muted text-xs">参加者私物として記録します（ボール在庫には加算されません）</p>
+                    </>
+                  )}
                 </div>
               )}
             </>
           )}
 
           <label className="bft-muted text-xs block mb-1">
-            非公開メモ（管理者のみに表示・空欄でも可）
+            {formType === "expense" ? "摘要（管理者のみに表示・空欄でも可）" : "非公開メモ（管理者のみに表示・空欄でも可）"}
           </label>
           <input
             type="text"
             value={formPrivateMemo}
             onChange={(e) => setFormPrivateMemo(e.target.value)}
-            placeholder="例：〇〇さん分は後日徴収予定"
+            placeholder={formType === "expense" ? "例：@584 ○○店で購入" : "例：〇〇さん分は後日徴収予定"}
             className="bft-input mb-3"
           />
 
@@ -1565,6 +1659,7 @@ export default function BallFundTracker() {
         <MasterListModal
           title={master.title}
           items={master.items}
+          valueOf={master.valueOf}
           placeholder={master.placeholder}
           saving={masterSaving}
           error={masterError}
@@ -1704,6 +1799,7 @@ function MemberPicker({ members, selectedIds, onToggle }) {
 function MasterListModal({
   title,
   items,
+  valueOf,
   placeholder,
   saving,
   error,
@@ -1749,6 +1845,11 @@ function MasterListModal({
             ) : (
               <>
                 <span className="min-w-0 truncate">{t.name}</span>
+                {valueOf && (
+                  <span className="bft-muted text-xs font-mono shrink-0" style={{ marginLeft: "auto", paddingRight: "0.75rem" }}>
+                    {valueOf(t)}
+                  </span>
+                )}
                 <span className="flex items-center gap-3 shrink-0">
                   <button
                     onClick={() => onMove(t, -1)}

@@ -13,6 +13,7 @@ import {
   CircleDot,
   Settings2,
   ChevronDown,
+  ChevronUp,
 } from "lucide-react";
 import {
   collection,
@@ -20,6 +21,8 @@ import {
   getDocs,
   addDoc,
   updateDoc,
+  writeBatch,
+  deleteField,
   serverTimestamp,
 } from "firebase/firestore";
 import {
@@ -34,6 +37,9 @@ const TX_COLLECTION = collection(db, "transactions");
 const BALL_COLLECTION = collection(db, "ballEntries");
 const TYPE_COLLECTION = collection(db, "ballTypes");
 const COURT_COLLECTION = collection(db, "courts");
+// 管理者だけが読み書きできる保存先（firestore.rules で制限）
+const MEMBER_COLLECTION = collection(db, "members");
+const PRIVATE_COLLECTION = collection(db, "privateDetails");
 const ADMIN_UID = "D4ZDzT4bjlazjno8O0Xt93XujHo1";
 
 const yen = (n) => `¥${Math.abs(n).toLocaleString("ja-JP")}`;
@@ -65,6 +71,13 @@ const groupByMonth = (list) => {
   });
   return groups;
 };
+
+// マスタ（種類・コート・メンバー）の並び順：sortOrder → 未設定は登録順（先頭側）
+const orderOf = (x) => (typeof x.sortOrder === "number" ? x.sortOrder : -Infinity);
+const sortMasters = (a, b) =>
+  orderOf(a) - orderOf(b) || (a.createdAt?.seconds || 0) - (b.createdAt?.seconds || 0);
+const nextOrder = (items) =>
+  items.reduce((m, x) => Math.max(m, typeof x.sortOrder === "number" ? x.sortOrder : -1), -1) + 1;
 
 const styles = `
 .bft-page { background:#F7F8F6; color:#2B2E2C; min-height:100vh; }
@@ -100,6 +113,9 @@ const styles = `
 .bft-error { color:#C0392B; font-size:0.75rem; }
 .bft-delete-btn { background:none; border:none; cursor:pointer; color:#B5B9B0; transition:color 0.15s; padding:0; }
 .bft-delete-btn:hover { color:#C0392B; }
+.bft-move-btn { background:none; border:none; cursor:pointer; color:#B5B9B0; transition:color 0.15s; padding:0; }
+.bft-move-btn:hover:not(:disabled) { color:#2B2E2C; }
+.bft-move-btn:disabled { opacity:0.3; cursor:default; }
 .bft-close-btn { background:none; border:none; cursor:pointer; color:#B5B9B0; transition:color 0.15s; padding:0; }
 .bft-close-btn:hover { color:#2B2E2C; }
 .bft-tabs { display:flex; gap:0.5rem; margin-bottom:1.25rem; }
@@ -123,6 +139,12 @@ const styles = `
 }
 .bft-month-head .chev { color:#8A8F87; transition:transform 0.15s; }
 .bft-month-head.closed .chev { transform:rotate(-90deg); }
+.bft-chips { display:flex; flex-wrap:wrap; gap:0.4rem; margin-bottom:0.5rem; }
+.bft-chip {
+  font-size:0.8rem; padding:0.35rem 0.75rem; border-radius:9999px; border:1px solid #DADDD6;
+  background:#fff; color:#2B2E2C; cursor:pointer; transition:all 0.15s;
+}
+.bft-chip.on { background:#8FAE3E; border-color:#8FAE3E; color:#fff; }
 `;
 
 export default function BallFundTracker() {
@@ -133,22 +155,23 @@ export default function BallFundTracker() {
   const [ballLoading, setBallLoading] = useState(true);
   const [ballEntries, setBallEntries] = useState([]);
   const [ballTypes, setBallTypes] = useState([]); // 削除済みも含む（表示名の参照用）
-  const [showTypeModal, setShowTypeModal] = useState(false);
-  const [newTypeName, setNewTypeName] = useState("");
-  const [editingTypeId, setEditingTypeId] = useState(null);
-  const [editingTypeName, setEditingTypeName] = useState("");
-  const [typeSaving, setTypeSaving] = useState(false);
-  const [typeErrorMsg, setTypeErrorMsg] = useState("");
+  const [courts, setCourts] = useState([]); // 削除済みも含む（表示名の参照用）
 
   // 月ごとの開閉状態（キー：YYYY-MM。未設定なら最新の月だけ開く）
   const [moneyMonthOpen, setMoneyMonthOpen] = useState({});
   const [ballMonthOpen, setBallMonthOpen] = useState({});
 
-  // コート（選択式マスタ）
-  const [courts, setCourts] = useState([]); // 削除済みも含む（表示名の参照用）
-  const [showCourtModal, setShowCourtModal] = useState(false);
-  const [courtSaving, setCourtSaving] = useState(false);
-  const [courtErrorMsg, setCourtErrorMsg] = useState("");
+  // マスタ管理モーダル（"" | "types" | "courts" | "members"）
+  const [masterModal, setMasterModal] = useState("");
+  const [masterSaving, setMasterSaving] = useState(false);
+  const [masterError, setMasterError] = useState("");
+
+  // 管理者だけが読める非公開データ（メンバー・参加者・非公開メモ・実質購入額）
+  const [members, setMembers] = useState([]); // 削除済みも含む
+  const [privateMap, setPrivateMap] = useState({}); // 記録ID → 非公開項目
+  const [privateError, setPrivateError] = useState("");
+  const [migrating, setMigrating] = useState(false);
+  const [migrateMsg, setMigrateMsg] = useState("");
 
   const [user, setUser] = useState(null);
   const [authChecked, setAuthChecked] = useState(false);
@@ -161,6 +184,7 @@ export default function BallFundTracker() {
   const [formType, setFormType] = useState("income");
   const [formDate, setFormDate] = useState(today());
   const [formParticipants, setFormParticipants] = useState(4);
+  const [formParticipantIds, setFormParticipantIds] = useState([]);
   const [formMemo, setFormMemo] = useState("");
   const [formPrivateMemo, setFormPrivateMemo] = useState("");
   const [formAmount, setFormAmount] = useState("");
@@ -182,6 +206,7 @@ export default function BallFundTracker() {
   const [useTypeId, setUseTypeId] = useState("");
   const [useMemo, setUseMemo] = useState("");
   const [useCourtId, setUseCourtId] = useState("");
+  const [useParticipantIds, setUseParticipantIds] = useState([]);
   const [ballSaving, setBallSaving] = useState(false);
   const [ballErrorMsg, setBallErrorMsg] = useState("");
 
@@ -206,15 +231,38 @@ export default function BallFundTracker() {
   const loadBallTypes = useCallback(async () => {
     const snap = await getDocs(TYPE_COLLECTION);
     const list = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
-    list.sort((a, b) => (a.createdAt?.seconds || 0) - (b.createdAt?.seconds || 0));
+    list.sort(sortMasters);
     setBallTypes(list);
   }, []);
 
   const loadCourts = useCallback(async () => {
     const snap = await getDocs(COURT_COLLECTION);
     const list = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
-    list.sort((a, b) => (a.createdAt?.seconds || 0) - (b.createdAt?.seconds || 0));
+    list.sort(sortMasters);
     setCourts(list);
+  }, []);
+
+  // 非公開データ（管理者のみ）。失敗しても例外は投げず、画面にエラーを出す
+  const loadPrivate = useCallback(async () => {
+    try {
+      const [pSnap, mSnap] = await Promise.all([
+        getDocs(PRIVATE_COLLECTION),
+        getDocs(MEMBER_COLLECTION),
+      ]);
+      const map = {};
+      pSnap.docs.forEach((d) => {
+        map[d.id] = d.data();
+      });
+      setPrivateMap(map);
+      const list = mSnap.docs.map((d) => ({ id: d.id, ...d.data() }));
+      list.sort(sortMasters);
+      setMembers(list);
+      setPrivateError("");
+    } catch (e) {
+      setPrivateError(
+        `非公開データの読み込みに失敗しました（${e?.message || "不明なエラー"}）。firestore.rules を反映済みか確認してください`
+      );
+    }
   }, []);
 
   useEffect(() => {
@@ -260,6 +308,17 @@ export default function BallFundTracker() {
     })();
   }, [loadCourts]);
 
+  // 管理者のときだけ非公開データを読む（それ以外は何も持たない）
+  useEffect(() => {
+    if (!isAdmin) {
+      setPrivateMap({});
+      setMembers([]);
+      setPrivateError("");
+      return;
+    }
+    loadPrivate();
+  }, [isAdmin, loadPrivate]);
+
   const balance = transactions.reduce(
     (sum, t) => sum + (t.type === "income" ? t.amount : -t.amount),
     0
@@ -283,6 +342,33 @@ export default function BallFundTracker() {
       ? [courtById(selectedId)]
       : []),
   ];
+
+  const activeMembers = members.filter((m) => !m.deleted);
+  const memberById = (id) => members.find((m) => m.id === id);
+  // チップに出すメンバー：有効なメンバー＋（編集中の記録に入っている）削除済みメンバー
+  const membersFor = (selectedIds) => [
+    ...activeMembers,
+    ...selectedIds
+      .filter((id) => !activeMembers.some((m) => m.id === id))
+      .map((id) => memberById(id))
+      .filter(Boolean),
+  ];
+  const participantNames = (ids) =>
+    ids
+      .map((id) => memberById(id)?.name)
+      .filter(Boolean)
+      .join("、");
+
+  // 非公開項目の取り出し（管理者のみ使う）。新しい保存先を優先し、なければ旧データ（公開側）を見る
+  const txPrivate = (t) => {
+    const p = privateMap[t.id];
+    return {
+      memo: p ? p.privateMemo || "" : t.privateMemo || "",
+      actual: p ? p.actualAmount ?? null : t.privateActualAmount ?? null,
+      participantIds: p?.participantIds || [],
+    };
+  };
+  const ballPrivateIds = (b) => privateMap[b.id]?.participantIds || [];
 
   // 在庫の集計キー：マスタID → なければ旧データの種類名 → なければ未指定
   const entryKey = (b) =>
@@ -336,6 +422,7 @@ export default function BallFundTracker() {
     setFormType("income");
     setFormDate(today());
     setFormParticipants(4);
+    setFormParticipantIds([]);
     setFormMemo("");
     setFormPrivateMemo("");
     setFormAmount("");
@@ -357,15 +444,17 @@ export default function BallFundTracker() {
   };
 
   const openEditForm = (t) => {
+    const pv = txPrivate(t);
     setErrorMsg("");
     setEditingId(t.id);
     setFormType(t.type);
     setFormDate(t.date);
     setFormMemo(t.memo || "");
-    setFormPrivateMemo(t.privateMemo || "");
+    setFormPrivateMemo(pv.memo);
     setFormUnitPrice(t.unitPrice || 100);
     setFormCourtId(t.courtId || "");
-    setFormActualAmount(t.privateActualAmount != null ? String(t.privateActualAmount) : "");
+    setFormActualAmount(pv.actual != null ? String(pv.actual) : "");
+    setFormParticipantIds(pv.participantIds);
     if (t.type === "income") {
       setFormParticipants(t.participants || Math.round(t.amount / 100) || 1);
       setFormAmount("");
@@ -402,6 +491,15 @@ export default function BallFundTracker() {
 
   const computedIncomeAmount = formParticipants * formUnitPrice;
   const computedBalls = formCans * formBallsPerCan;
+
+  // 参加者を選ぶと、参加人数を選んだ人数に合わせる（ゲストがいる場合は人数を手で増やす）
+  const toggleFormParticipant = (id) => {
+    const next = formParticipantIds.includes(id)
+      ? formParticipantIds.filter((x) => x !== id)
+      : [...formParticipantIds, id];
+    setFormParticipantIds(next);
+    if (next.length > 0) setFormParticipants(next.length);
+  };
 
   const handleAdd = async () => {
     setErrorMsg("");
@@ -452,29 +550,42 @@ export default function BallFundTracker() {
         ? formMemo.trim() || `練習日徴収（${formParticipants}人）`
         : formMemo.trim();
 
+    // 公開側に保存する項目（非公開メモ・実質購入額・参加者は含めない）
     const payload = {
       date: formDate,
       type: formType,
       memo,
-      privateMemo: formPrivateMemo.trim() || "",
       amount,
       participants: formType === "income" ? formParticipants : null,
       unitPrice: formType === "income" ? formUnitPrice : null,
       courtId: formType === "income" ? formCourtId || null : null,
       court: formType === "income" ? courtById(formCourtId)?.name || "" : "",
-      privateActualAmount: formType === "expense" ? actualAmount : null,
       deleted: false,
     };
 
     setSaving(true);
     try {
-      let txId = editingId;
+      // 記帳・非公開項目・ボール在庫連携を1回のバッチで保存する（途中で失敗しても半端に残らない）
+      const batch = writeBatch(db);
+      const txRef = editingId ? doc(db, "transactions", editingId) : doc(TX_COLLECTION);
       if (editingId) {
-        await updateDoc(doc(db, "transactions", editingId), payload);
+        // 旧バージョンが公開側に残した非公開項目も、ここで取り除く
+        batch.update(txRef, {
+          ...payload,
+          privateMemo: deleteField(),
+          privateActualAmount: deleteField(),
+        });
       } else {
-        const ref = await addDoc(TX_COLLECTION, { ...payload, createdAt: serverTimestamp() });
-        txId = ref.id;
+        batch.set(txRef, { ...payload, createdAt: serverTimestamp() });
       }
+
+      batch.set(doc(db, "privateDetails", txRef.id), {
+        kind: "tx",
+        privateMemo: formPrivateMemo.trim(),
+        actualAmount: formType === "expense" ? actualAmount : null,
+        participantIds: formType === "income" ? formParticipantIds : [],
+        updatedAt: serverTimestamp(),
+      });
 
       // ボール在庫との連携
       if (formType === "expense" && formIsBallPurchase) {
@@ -487,21 +598,22 @@ export default function BallFundTracker() {
           ballsPerCan: formBallsPerCan,
           balls: computedBalls,
           memo: memo,
-          sourceTxId: txId,
+          sourceTxId: txRef.id,
           deleted: false,
         };
         if (editingBallEntryId) {
-          await updateDoc(doc(db, "ballEntries", editingBallEntryId), ballPayload);
+          batch.update(doc(db, "ballEntries", editingBallEntryId), ballPayload);
         } else {
-          await addDoc(BALL_COLLECTION, { ...ballPayload, createdAt: serverTimestamp() });
+          batch.set(doc(BALL_COLLECTION), { ...ballPayload, createdAt: serverTimestamp() });
         }
       } else if (editingBallEntryId) {
         // ボール購入のチェックを外した場合は連携エントリを削除扱いに
-        await updateDoc(doc(db, "ballEntries", editingBallEntryId), { deleted: true });
+        batch.update(doc(db, "ballEntries", editingBallEntryId), { deleted: true });
       }
 
-      await loadTransactions();
-      await loadBallEntries();
+      await batch.commit();
+
+      await Promise.all([loadTransactions(), loadBallEntries(), loadPrivate()]);
       setShowForm(false);
       resetForm();
     } catch (e) {
@@ -537,6 +649,56 @@ export default function BallFundTracker() {
     return bt - at;
   });
 
+  // ---------- 非公開データの移行（初回のみ） ----------
+  // 旧バージョンで公開側（transactions）に保存していた非公開メモ・実質購入額を、
+  // 管理者だけが読める privateDetails へ移し、公開側からは取り除く。何度実行しても安全。
+  const handleMigratePrivate = async () => {
+    if (
+      !window.confirm(
+        "公開側に残っている非公開メモ・実質購入額を、管理者だけが読める保存先へ移します。\n移行後は公開側から消えます。実行しますか？"
+      )
+    )
+      return;
+    setMigrating(true);
+    setMigrateMsg("");
+    try {
+      const snap = await getDocs(TX_COLLECTION); // 削除済みの記録も含めて確認する
+      const targets = snap.docs.filter((d) => {
+        const x = d.data();
+        return (
+          (typeof x.privateMemo === "string" && x.privateMemo.trim() !== "") ||
+          x.privateActualAmount != null
+        );
+      });
+      for (let i = 0; i < targets.length; i += 200) {
+        const batch = writeBatch(db);
+        targets.slice(i, i + 200).forEach((d) => {
+          const x = d.data();
+          batch.set(
+            doc(db, "privateDetails", d.id),
+            {
+              kind: "tx",
+              privateMemo: (x.privateMemo || "").trim(),
+              actualAmount: x.privateActualAmount ?? null,
+              updatedAt: serverTimestamp(),
+            },
+            { merge: true }
+          );
+          batch.update(d.ref, { privateMemo: deleteField(), privateActualAmount: deleteField() });
+        });
+        await batch.commit();
+      }
+      await Promise.all([loadTransactions(), loadPrivate()]);
+      setMigrateMsg(
+        targets.length === 0 ? "移行する対象はありませんでした" : `${targets.length}件を移行しました`
+      );
+    } catch (e) {
+      setMigrateMsg(`移行に失敗しました（${e?.message || "不明なエラー"}）`);
+    } finally {
+      setMigrating(false);
+    }
+  };
+
   // ---------- ボール使用フォーム（ボール残高タブ） ----------
 
   const resetBallUseForm = () => {
@@ -545,6 +707,7 @@ export default function BallFundTracker() {
     setUseTypeId("");
     setUseMemo("");
     setUseCourtId("");
+    setUseParticipantIds([]);
     setBallErrorMsg("");
     setEditingUseId(null);
   };
@@ -564,7 +727,14 @@ export default function BallFundTracker() {
     );
     setUseMemo(b.memo || "");
     setUseCourtId(b.courtId || "");
+    setUseParticipantIds(ballPrivateIds(b));
     setShowBallUseForm(true);
+  };
+
+  const toggleUseParticipant = (id) => {
+    setUseParticipantIds((prev) =>
+      prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]
+    );
   };
 
   const handleSaveBallUse = async () => {
@@ -599,12 +769,20 @@ export default function BallFundTracker() {
     };
     setBallSaving(true);
     try {
+      const batch = writeBatch(db);
+      const ref = editingUseId ? doc(db, "ballEntries", editingUseId) : doc(BALL_COLLECTION);
       if (editingUseId) {
-        await updateDoc(doc(db, "ballEntries", editingUseId), payload);
+        batch.update(ref, payload);
       } else {
-        await addDoc(BALL_COLLECTION, { ...payload, createdAt: serverTimestamp() });
+        batch.set(ref, { ...payload, createdAt: serverTimestamp() });
       }
-      await loadBallEntries();
+      batch.set(doc(db, "privateDetails", ref.id), {
+        kind: "ball",
+        participantIds: useParticipantIds,
+        updatedAt: serverTimestamp(),
+      });
+      await batch.commit();
+      await Promise.all([loadBallEntries(), loadPrivate()]);
       setShowBallUseForm(false);
       resetBallUseForm();
     } catch (e) {
@@ -624,143 +802,138 @@ export default function BallFundTracker() {
     }
   };
 
-  // ---------- ボール種類マスタ ----------
+  // ---------- マスタ管理（ボールの種類・コート・メンバー共通） ----------
 
-  const openTypeModal = () => {
-    setTypeErrorMsg("");
-    setNewTypeName("");
-    setEditingTypeId(null);
-    setShowTypeModal(true);
+  const masterConfigs = {
+    types: {
+      title: "ボールの種類を管理",
+      coll: "ballTypes",
+      items: activeTypes,
+      reload: loadBallTypes,
+      placeholder: "例：ダンロップ フォート",
+      deleteMessage: (m) =>
+        ballEntries.some((b) => b.ballTypeId === m.id)
+          ? `「${m.name}」は過去の記録で使われています。\n削除しても過去の記録・在庫は残りますが、プルダウンには出なくなります。削除しますか？`
+          : `「${m.name}」を削除しますか？`,
+    },
+    courts: {
+      title: "コートを管理",
+      coll: "courts",
+      items: activeCourts,
+      reload: loadCourts,
+      placeholder: "例：1番コート",
+      deleteMessage: (m) =>
+        transactions.some((t) => t.courtId === m.id) || ballEntries.some((b) => b.courtId === m.id)
+          ? `「${m.name}」は過去の記録で使われています。\n削除しても過去の記録のコート名は残りますが、選択肢には出なくなります。削除しますか？`
+          : `「${m.name}」を削除しますか？`,
+    },
+    members: {
+      title: "メンバーを管理（管理者のみ表示）",
+      coll: "members",
+      items: activeMembers,
+      reload: loadPrivate,
+      placeholder: "例：ニックネーム",
+      deleteMessage: (m) =>
+        Object.values(privateMap).some((p) => (p.participantIds || []).includes(m.id))
+          ? `「${m.name}」は過去の記録の参加者に入っています。\n削除しても過去の記録には残りますが、選択肢には出なくなります。削除しますか？`
+          : `「${m.name}」を削除しますか？`,
+    },
   };
+  const master = masterModal ? masterConfigs[masterModal] : null;
 
-  const handleAddType = async () => {
-    setTypeErrorMsg("");
-    const name = newTypeName.trim();
-    if (!name) {
-      setTypeErrorMsg("種類名を入力してください");
-      return;
-    }
-    if (activeTypes.some((t) => t.name === name)) {
-      setTypeErrorMsg("同じ名前の種類がすでにあります");
-      return;
-    }
-    setTypeSaving(true);
-    try {
-      await addDoc(TYPE_COLLECTION, { name, deleted: false, createdAt: serverTimestamp() });
-      setNewTypeName("");
-      await loadBallTypes();
-    } catch (e) {
-      setTypeErrorMsg(`保存に失敗しました（${e?.message || "不明なエラー"}）`);
-    } finally {
-      setTypeSaving(false);
-    }
-  };
-
-  const handleRenameType = async (t) => {
-    setTypeErrorMsg("");
-    const name = editingTypeName.trim();
-    if (!name) {
-      setTypeErrorMsg("種類名を入力してください");
-      return;
-    }
-    if (activeTypes.some((x) => x.id !== t.id && x.name === name)) {
-      setTypeErrorMsg("同じ名前の種類がすでにあります");
-      return;
-    }
-    setTypeSaving(true);
-    try {
-      await updateDoc(doc(db, "ballTypes", t.id), { name, deleted: false });
-      setEditingTypeId(null);
-      await loadBallTypes();
-    } catch (e) {
-      setTypeErrorMsg(`保存に失敗しました（${e?.message || "不明なエラー"}）`);
-    } finally {
-      setTypeSaving(false);
-    }
-  };
-
-  const handleDeleteType = async (t) => {
-    const used = ballEntries.some((b) => b.ballTypeId === t.id);
-    const msg = used
-      ? `「${t.name}」は過去の記録で使われています。\n削除しても過去の記録・在庫は残りますが、プルダウンには出なくなります。削除しますか？`
-      : `「${t.name}」を削除しますか？`;
-    if (!window.confirm(msg)) return;
-    try {
-      await updateDoc(doc(db, "ballTypes", t.id), { deleted: true });
-      await loadBallTypes();
-    } catch (e) {
-      setTypeErrorMsg(`削除に失敗しました（${e?.message || "不明なエラー"}）`);
-    }
-  };
-
-  // ---------- コートマスタ ----------
-
-  const openCourtModal = () => {
-    setCourtErrorMsg("");
-    setShowCourtModal(true);
+  const openMaster = (key) => {
+    setMasterError("");
+    setMasterModal(key);
   };
 
   // 追加・名前変更は成功したら true を返す（モーダル側の入力欄の後始末に使う）
-  const handleAddCourt = async (raw) => {
-    setCourtErrorMsg("");
+  const handleMasterAdd = async (raw) => {
+    if (!master) return false;
+    setMasterError("");
     const name = raw.trim();
     if (!name) {
-      setCourtErrorMsg("コート名を入力してください");
+      setMasterError("名前を入力してください");
       return false;
     }
-    if (activeCourts.some((c) => c.name === name)) {
-      setCourtErrorMsg("同じ名前のコートがすでにあります");
+    if (master.items.some((x) => x.name === name)) {
+      setMasterError("同じ名前がすでにあります");
       return false;
     }
-    setCourtSaving(true);
+    setMasterSaving(true);
     try {
-      await addDoc(COURT_COLLECTION, { name, deleted: false, createdAt: serverTimestamp() });
-      await loadCourts();
+      await addDoc(collection(db, master.coll), {
+        name,
+        deleted: false,
+        sortOrder: nextOrder(master.items),
+        createdAt: serverTimestamp(),
+      });
+      await master.reload();
       return true;
     } catch (e) {
-      setCourtErrorMsg(`保存に失敗しました（${e?.message || "不明なエラー"}）`);
+      setMasterError(`保存に失敗しました（${e?.message || "不明なエラー"}）`);
       return false;
     } finally {
-      setCourtSaving(false);
+      setMasterSaving(false);
     }
   };
 
-  const handleRenameCourt = async (c, raw) => {
-    setCourtErrorMsg("");
+  const handleMasterRename = async (item, raw) => {
+    if (!master) return false;
+    setMasterError("");
     const name = raw.trim();
     if (!name) {
-      setCourtErrorMsg("コート名を入力してください");
+      setMasterError("名前を入力してください");
       return false;
     }
-    if (activeCourts.some((x) => x.id !== c.id && x.name === name)) {
-      setCourtErrorMsg("同じ名前のコートがすでにあります");
+    if (master.items.some((x) => x.id !== item.id && x.name === name)) {
+      setMasterError("同じ名前がすでにあります");
       return false;
     }
-    setCourtSaving(true);
+    setMasterSaving(true);
     try {
-      await updateDoc(doc(db, "courts", c.id), { name, deleted: false });
-      await loadCourts();
+      await updateDoc(doc(db, master.coll, item.id), { name });
+      await master.reload();
       return true;
     } catch (e) {
-      setCourtErrorMsg(`保存に失敗しました（${e?.message || "不明なエラー"}）`);
+      setMasterError(`保存に失敗しました（${e?.message || "不明なエラー"}）`);
       return false;
     } finally {
-      setCourtSaving(false);
+      setMasterSaving(false);
     }
   };
 
-  const handleDeleteCourt = async (c) => {
-    const used =
-      transactions.some((t) => t.courtId === c.id) || ballEntries.some((b) => b.courtId === c.id);
-    const msg = used
-      ? `「${c.name}」は過去の記録で使われています。\n削除しても過去の記録のコート名は残りますが、選択肢には出なくなります。削除しますか？`
-      : `「${c.name}」を削除しますか？`;
-    if (!window.confirm(msg)) return;
+  const handleMasterDelete = async (item) => {
+    if (!master) return;
+    if (!window.confirm(master.deleteMessage(item))) return;
+    setMasterError("");
     try {
-      await updateDoc(doc(db, "courts", c.id), { deleted: true });
-      await loadCourts();
+      await updateDoc(doc(db, master.coll, item.id), { deleted: true });
+      await master.reload();
     } catch (e) {
-      setCourtErrorMsg(`削除に失敗しました（${e?.message || "不明なエラー"}）`);
+      setMasterError(`削除に失敗しました（${e?.message || "不明なエラー"}）`);
+    }
+  };
+
+  // 上下に1つ動かす。表示中の全項目に 0,1,2… の順番を振り直して保存する
+  const handleMasterMove = async (item, dir) => {
+    if (!master) return;
+    const items = master.items;
+    const idx = items.findIndex((x) => x.id === item.id);
+    const to = idx + dir;
+    if (idx < 0 || to < 0 || to >= items.length) return;
+    const next = [...items];
+    [next[idx], next[to]] = [next[to], next[idx]];
+    setMasterError("");
+    setMasterSaving(true);
+    try {
+      const batch = writeBatch(db);
+      next.forEach((x, i) => batch.update(doc(db, master.coll, x.id), { sortOrder: i }));
+      await batch.commit();
+      await master.reload();
+    } catch (e) {
+      setMasterError(`並び替えに失敗しました（${e?.message || "不明なエラー"}）`);
+    } finally {
+      setMasterSaving(false);
     }
   };
 
@@ -843,15 +1016,19 @@ export default function BallFundTracker() {
             )}
 
             {isAdmin && !loading && (
-              <button
-                onClick={openCourtModal}
-                className="bft-btn-outline mb-6"
-                style={{ width: "100%", flex: "none" }}
-              >
-                <Settings2 size={14} />
-                コートを管理
-              </button>
+              <div className="flex gap-2 mb-6">
+                <button onClick={() => openMaster("courts")} className="bft-btn-outline">
+                  <Settings2 size={14} />
+                  コートを管理
+                </button>
+                <button onClick={() => openMaster("members")} className="bft-btn-outline">
+                  <Settings2 size={14} />
+                  メンバーを管理
+                </button>
+              </div>
             )}
+
+            {isAdmin && privateError && <p className="bft-error mb-4">{privateError}</p>}
 
             <div className="mb-4">
               <p className="bft-muted text-xs mb-3 tracking-wide">履歴</p>
@@ -890,52 +1067,71 @@ export default function BallFundTracker() {
                       </button>
                       {open && (
                         <ul className="space-y-2">
-                          {g.items.map((t) => (
-                  <li key={t.id} className="bft-card flex items-center justify-between px-4 py-3">
-                    <div className="flex items-center gap-3 min-w-0">
-                      <span
-                        className="w-2 h-2 rounded-full shrink-0"
-                        style={{ backgroundColor: t.type === "income" ? "#8FAE3E" : "#C97B4A" }}
-                      />
-                      <div className="min-w-0">
-                        <p className="text-sm truncate">{t.memo}</p>
-                        <p className="bft-muted text-xs font-mono">
-                          {fmtDate(t.date)}
-                          {courtName(t) ? ` ・${courtName(t)}` : ""}
-                        </p>
-                        {isAdmin && t.privateMemo && (
-                          <p className="text-xs mt-0.5 truncate" style={{ color: "#B15E2E" }}>
-                            🔒 {t.privateMemo}
-                          </p>
-                        )}
-                        {isAdmin && t.privateActualAmount != null && (
-                          <p className="text-xs mt-0.5" style={{ color: "#B15E2E" }}>
-                            🔒 実質購入額 {yen(t.privateActualAmount)}
-                          </p>
-                        )}
-                      </div>
-                    </div>
-                    <div className="flex items-center gap-3 shrink-0">
-                      <span
-                        className="font-mono text-sm"
-                        style={{ color: t.type === "income" ? "#6B8A2E" : "#B15E2E" }}
-                      >
-                        {t.type === "income" ? "+" : "−"}
-                        {yen(t.amount)}
-                      </span>
-                      {isAdmin && (
-                        <>
-                          <button onClick={() => openEditForm(t)} className="bft-delete-btn" aria-label="編集">
-                            <Pencil size={14} />
-                          </button>
-                          <button onClick={() => handleDelete(t)} className="bft-delete-btn" aria-label="削除">
-                            <Trash2 size={14} />
-                          </button>
-                        </>
-                      )}
-                    </div>
-                  </li>
-                          ))}
+                          {g.items.map((t) => {
+                            const pv = isAdmin ? txPrivate(t) : null;
+                            return (
+                              <li
+                                key={t.id}
+                                className="bft-card flex items-center justify-between px-4 py-3"
+                              >
+                                <div className="flex items-center gap-3 min-w-0">
+                                  <span
+                                    className="w-2 h-2 rounded-full shrink-0"
+                                    style={{ backgroundColor: t.type === "income" ? "#8FAE3E" : "#C97B4A" }}
+                                  />
+                                  <div className="min-w-0">
+                                    <p className="text-sm truncate">{t.memo}</p>
+                                    <p className="bft-muted text-xs font-mono">
+                                      {fmtDate(t.date)}
+                                      {courtName(t) ? ` ・${courtName(t)}` : ""}
+                                    </p>
+                                    {pv && pv.memo && (
+                                      <p className="text-xs mt-0.5 truncate" style={{ color: "#B15E2E" }}>
+                                        🔒 {pv.memo}
+                                      </p>
+                                    )}
+                                    {pv && pv.actual != null && (
+                                      <p className="text-xs mt-0.5" style={{ color: "#B15E2E" }}>
+                                        🔒 実質購入額 {yen(pv.actual)}
+                                      </p>
+                                    )}
+                                    {pv && pv.participantIds.length > 0 && (
+                                      <p className="text-xs mt-0.5 truncate" style={{ color: "#B15E2E" }}>
+                                        🔒 参加者：{participantNames(pv.participantIds)}
+                                      </p>
+                                    )}
+                                  </div>
+                                </div>
+                                <div className="flex items-center gap-3 shrink-0">
+                                  <span
+                                    className="font-mono text-sm"
+                                    style={{ color: t.type === "income" ? "#6B8A2E" : "#B15E2E" }}
+                                  >
+                                    {t.type === "income" ? "+" : "−"}
+                                    {yen(t.amount)}
+                                  </span>
+                                  {isAdmin && (
+                                    <>
+                                      <button
+                                        onClick={() => openEditForm(t)}
+                                        className="bft-delete-btn"
+                                        aria-label="編集"
+                                      >
+                                        <Pencil size={14} />
+                                      </button>
+                                      <button
+                                        onClick={() => handleDelete(t)}
+                                        className="bft-delete-btn"
+                                        aria-label="削除"
+                                      >
+                                        <Trash2 size={14} />
+                                      </button>
+                                    </>
+                                  )}
+                                </div>
+                              </li>
+                            );
+                          })}
                         </ul>
                       )}
                     </div>
@@ -943,6 +1139,20 @@ export default function BallFundTracker() {
                 })}
               </div>
             </div>
+
+            {isAdmin && (
+              <div className="text-center mt-6">
+                <button
+                  onClick={handleMigratePrivate}
+                  disabled={migrating}
+                  className="bft-delete-btn text-xs"
+                  style={{ textDecoration: "underline" }}
+                >
+                  {migrating ? "移行中…" : "非公開データを移行（初回のみ）"}
+                </button>
+                {migrateMsg && <p className="bft-muted text-xs mt-1">{migrateMsg}</p>}
+              </div>
+            )}
           </>
         ) : (
           <>
@@ -996,7 +1206,7 @@ export default function BallFundTracker() {
 
             {isAdmin && !ballLoading && (
               <button
-                onClick={openTypeModal}
+                onClick={() => openMaster("types")}
                 className="bft-btn-outline mb-6"
                 style={{ width: "100%", flex: "none" }}
               >
@@ -1043,51 +1253,70 @@ export default function BallFundTracker() {
                       </button>
                       {open && (
                         <ul className="space-y-2">
-                          {g.items.map((b) => (
-                  <li key={b.id} className="bft-card flex items-center justify-between px-4 py-3">
-                    <div className="flex items-center gap-3 min-w-0">
-                      <span
-                        className="w-2 h-2 rounded-full shrink-0"
-                        style={{ backgroundColor: b.kind === "purchase" ? "#4A7FB5" : "#8A8F87" }}
-                      />
-                      <div className="min-w-0">
-                        <p className="text-sm truncate">
-                          {b.kind === "purchase"
-                            ? `購入：${entryTypeName(b)}（${b.cans}缶×${b.ballsPerCan}球）`
-                            : `使用：${entryTypeName(b)}${b.memo ? `（${b.memo}）` : ""}`}
-                        </p>
-                        <p className="bft-muted text-xs font-mono">
-                          {fmtDate(b.date)}
-                          {b.kind === "use" && courtName(b) ? ` ・${courtName(b)}` : ""}
-                        </p>
-                      </div>
-                    </div>
-                    <div className="flex items-center gap-3 shrink-0">
-                      <span
-                        className="font-mono text-sm"
-                        style={{ color: b.kind === "purchase" ? "#4A7FB5" : "#B15E2E" }}
-                      >
-                        {b.kind === "purchase" ? "+" : "−"}
-                        {b.balls}球
-                      </span>
-                      {isAdmin && b.kind === "use" && (
-                        <>
-                          <button onClick={() => openEditBallUseForm(b)} className="bft-delete-btn" aria-label="編集">
-                            <Pencil size={14} />
-                          </button>
-                          <button onClick={() => handleDeleteBallUse(b)} className="bft-delete-btn" aria-label="削除">
-                            <Trash2 size={14} />
-                          </button>
-                        </>
-                      )}
-                      {isAdmin && b.kind === "purchase" && (
-                        <span className="bft-muted-light" style={{ fontSize: "10px" }}>
-                          資金残高タブで編集
-                        </span>
-                      )}
-                    </div>
-                  </li>
-                          ))}
+                          {g.items.map((b) => {
+                            const pIds = isAdmin && b.kind === "use" ? ballPrivateIds(b) : [];
+                            return (
+                              <li
+                                key={b.id}
+                                className="bft-card flex items-center justify-between px-4 py-3"
+                              >
+                                <div className="flex items-center gap-3 min-w-0">
+                                  <span
+                                    className="w-2 h-2 rounded-full shrink-0"
+                                    style={{ backgroundColor: b.kind === "purchase" ? "#4A7FB5" : "#8A8F87" }}
+                                  />
+                                  <div className="min-w-0">
+                                    <p className="text-sm truncate">
+                                      {b.kind === "purchase"
+                                        ? `購入：${entryTypeName(b)}（${b.cans}缶×${b.ballsPerCan}球）`
+                                        : `使用：${entryTypeName(b)}${b.memo ? `（${b.memo}）` : ""}`}
+                                    </p>
+                                    <p className="bft-muted text-xs font-mono">
+                                      {fmtDate(b.date)}
+                                      {b.kind === "use" && courtName(b) ? ` ・${courtName(b)}` : ""}
+                                    </p>
+                                    {pIds.length > 0 && (
+                                      <p className="text-xs mt-0.5 truncate" style={{ color: "#B15E2E" }}>
+                                        🔒 参加者：{participantNames(pIds)}
+                                      </p>
+                                    )}
+                                  </div>
+                                </div>
+                                <div className="flex items-center gap-3 shrink-0">
+                                  <span
+                                    className="font-mono text-sm"
+                                    style={{ color: b.kind === "purchase" ? "#4A7FB5" : "#B15E2E" }}
+                                  >
+                                    {b.kind === "purchase" ? "+" : "−"}
+                                    {b.balls}球
+                                  </span>
+                                  {isAdmin && b.kind === "use" && (
+                                    <>
+                                      <button
+                                        onClick={() => openEditBallUseForm(b)}
+                                        className="bft-delete-btn"
+                                        aria-label="編集"
+                                      >
+                                        <Pencil size={14} />
+                                      </button>
+                                      <button
+                                        onClick={() => handleDeleteBallUse(b)}
+                                        className="bft-delete-btn"
+                                        aria-label="削除"
+                                      >
+                                        <Trash2 size={14} />
+                                      </button>
+                                    </>
+                                  )}
+                                  {isAdmin && b.kind === "purchase" && (
+                                    <span className="bft-muted-light" style={{ fontSize: "10px" }}>
+                                      資金残高タブで編集
+                                    </span>
+                                  )}
+                                </div>
+                              </li>
+                            );
+                          })}
                         </ul>
                       )}
                     </div>
@@ -1167,6 +1396,25 @@ export default function BallFundTracker() {
                 {formParticipants}人 × {yen(formUnitPrice)} ={" "}
                 <span style={{ color: "#6B8A2E" }}>{yen(computedIncomeAmount)}</span>
               </p>
+
+              <label className="bft-muted text-xs block mb-1">参加者（管理者のみ表示・任意）</label>
+              {membersFor(formParticipantIds).length > 0 ? (
+                <MemberPicker
+                  members={membersFor(formParticipantIds)}
+                  selectedIds={formParticipantIds}
+                  onToggle={toggleFormParticipant}
+                />
+              ) : (
+                <p className="bft-muted text-xs mb-3">
+                  「資金残高」タブの「メンバーを管理」で登録すると、ここで選べます
+                </p>
+              )}
+              {formParticipantIds.length > 0 && (
+                <p className="bft-muted text-xs mb-3 font-mono">
+                  選択中 {formParticipantIds.length}人
+                  {formParticipantIds.length !== formParticipants && "（参加人数と異なります）"}
+                </p>
+              )}
 
               <label className="bft-muted text-xs block mb-1">コート（任意）</label>
               <select
@@ -1312,85 +1560,20 @@ export default function BallFundTracker() {
         </Modal>
       )}
 
-      {/* ボール種類マスタ管理モーダル */}
-      {showTypeModal && (
-        <Modal onClose={() => setShowTypeModal(false)}>
-          <h2 className="text-sm font-semibold mb-4">ボールの種類を管理</h2>
-
-          <ul className="mb-4">
-            {activeTypes.length === 0 && (
-              <li className="bft-muted text-xs py-2">まだ種類が登録されていません</li>
-            )}
-            {activeTypes.map((t) => (
-              <li key={t.id} className="bft-stock-row" style={{ alignItems: "center" }}>
-                {editingTypeId === t.id ? (
-                  <>
-                    <input
-                      type="text"
-                      value={editingTypeName}
-                      onChange={(e) => setEditingTypeName(e.target.value)}
-                      className="bft-input"
-                      style={{ marginRight: "0.5rem" }}
-                    />
-                    <button
-                      onClick={() => handleRenameType(t)}
-                      disabled={typeSaving}
-                      className="text-xs"
-                      style={{ color: "#6B8A2E", whiteSpace: "nowrap" }}
-                    >
-                      保存
-                    </button>
-                  </>
-                ) : (
-                  <>
-                    <span className="min-w-0 truncate">{t.name}</span>
-                    <span className="flex items-center gap-3 shrink-0">
-                      <button
-                        onClick={() => { setEditingTypeId(t.id); setEditingTypeName(t.name); setTypeErrorMsg(""); }}
-                        className="bft-delete-btn"
-                        aria-label="名前を変更"
-                      >
-                        <Pencil size={14} />
-                      </button>
-                      <button onClick={() => handleDeleteType(t)} className="bft-delete-btn" aria-label="削除">
-                        <Trash2 size={14} />
-                      </button>
-                    </span>
-                  </>
-                )}
-              </li>
-            ))}
-          </ul>
-
-          <label className="bft-muted text-xs block mb-1">新しい種類を追加</label>
-          <input
-            type="text"
-            value={newTypeName}
-            onChange={(e) => setNewTypeName(e.target.value)}
-            placeholder="例：ダンロップ フォート"
-            className="bft-input mb-3"
-          />
-          {typeErrorMsg && <p className="bft-error mb-2">{typeErrorMsg}</p>}
-          <button onClick={handleAddType} disabled={typeSaving} className="bft-btn-primary">
-            {typeSaving && <Loader2 size={14} className="animate-spin" />}
-            追加する
-          </button>
-        </Modal>
-      )}
-
-      {/* コートマスタ管理モーダル */}
-      {showCourtModal && (
+      {/* マスタ管理モーダル（ボールの種類・コート・メンバー共通） */}
+      {master && (
         <MasterListModal
-          title="コートを管理"
-          items={activeCourts}
-          placeholder="例：1番コート"
-          saving={courtSaving}
-          error={courtErrorMsg}
-          onClose={() => setShowCourtModal(false)}
-          onAdd={handleAddCourt}
-          onRename={handleRenameCourt}
-          onDelete={handleDeleteCourt}
-          onClearError={() => setCourtErrorMsg("")}
+          title={master.title}
+          items={master.items}
+          placeholder={master.placeholder}
+          saving={masterSaving}
+          error={masterError}
+          onClose={() => setMasterModal("")}
+          onAdd={handleMasterAdd}
+          onRename={handleMasterRename}
+          onDelete={handleMasterDelete}
+          onMove={handleMasterMove}
+          onClearError={() => setMasterError("")}
         />
       )}
 
@@ -1425,6 +1608,22 @@ export default function BallFundTracker() {
             <p className="bft-muted text-xs mb-3">
               「資金残高」タブの「コートを管理」でコートを登録すると、ここで選べます
             </p>
+          )}
+
+          <label className="bft-muted text-xs block mb-1">参加者（管理者のみ表示・任意）</label>
+          {membersFor(useParticipantIds).length > 0 ? (
+            <MemberPicker
+              members={membersFor(useParticipantIds)}
+              selectedIds={useParticipantIds}
+              onToggle={toggleUseParticipant}
+            />
+          ) : (
+            <p className="bft-muted text-xs mb-3">
+              「資金残高」タブの「メンバーを管理」で登録すると、ここで選べます
+            </p>
+          )}
+          {useParticipantIds.length > 0 && (
+            <p className="bft-muted text-xs mb-3 font-mono">選択中 {useParticipantIds.length}人</p>
           )}
 
           <label className="bft-muted text-xs block mb-1">ボールの種類</label>
@@ -1482,7 +1681,26 @@ export default function BallFundTracker() {
   );
 }
 
-// 名前だけを持つ選択肢マスタ（コートなど）の追加・名前変更・削除モーダル
+// メンバーをタップで選ぶチップ
+function MemberPicker({ members, selectedIds, onToggle }) {
+  return (
+    <div className="bft-chips">
+      {members.map((m) => (
+        <button
+          type="button"
+          key={m.id}
+          onClick={() => onToggle(m.id)}
+          className={`bft-chip ${selectedIds.includes(m.id) ? "on" : ""}`}
+        >
+          {m.name}
+          {m.deleted ? "（削除済み）" : ""}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+// 名前だけを持つ選択肢マスタ（ボールの種類・コート・メンバー）の追加・名前変更・並び替え・削除モーダル
 function MasterListModal({
   title,
   items,
@@ -1493,6 +1711,7 @@ function MasterListModal({
   onAdd,
   onRename,
   onDelete,
+  onMove,
   onClearError,
 }) {
   const [newName, setNewName] = useState("");
@@ -1505,7 +1724,7 @@ function MasterListModal({
 
       <ul className="mb-4">
         {items.length === 0 && <li className="bft-muted text-xs py-2">まだ登録されていません</li>}
-        {items.map((t) => (
+        {items.map((t, index) => (
           <li key={t.id} className="bft-stock-row" style={{ alignItems: "center" }}>
             {editingId === t.id ? (
               <>
@@ -1531,6 +1750,22 @@ function MasterListModal({
               <>
                 <span className="min-w-0 truncate">{t.name}</span>
                 <span className="flex items-center gap-3 shrink-0">
+                  <button
+                    onClick={() => onMove(t, -1)}
+                    disabled={saving || index === 0}
+                    className="bft-move-btn"
+                    aria-label="上へ"
+                  >
+                    <ChevronUp size={16} />
+                  </button>
+                  <button
+                    onClick={() => onMove(t, 1)}
+                    disabled={saving || index === items.length - 1}
+                    className="bft-move-btn"
+                    aria-label="下へ"
+                  >
+                    <ChevronDown size={16} />
+                  </button>
                   <button
                     onClick={() => {
                       setEditingId(t.id);

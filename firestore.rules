@@ -2,12 +2,17 @@ rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
 
-    // 取引データ：全員が閲覧可能。
-    // 作成・更新・削除は、管理者のGoogleアカウント（UID）でログインしている場合のみ許可。
+    // 管理者（Googleアカウントのみ）。管理者を交代するときは、このUIDだけ書き換える。
+    function isAdmin() {
+      return request.auth != null
+          && request.auth.uid == 'D4ZDzT4bjlazjno8O0Xt93XujHo1';
+    }
+
+    // 取引データ：全員が閲覧可能。作成・更新は管理者のみ。
+    // （非公開メモ・実質購入額・参加者は、ここではなく privateDetails に保存する）
     match /transactions/{txId} {
       allow read: if true;
-      allow create, update: if request.auth != null
-                             && request.auth.uid == 'D4ZDzT4bjlazjno8O0Xt93XujHo1'
+      allow create, update: if isAdmin()
                              && request.resource.data.keys().hasAll(['date', 'type', 'memo', 'amount']);
       allow delete: if false; // 削除は「deleted: true」への更新で行うため不要
     }
@@ -16,29 +21,42 @@ service cloud.firestore {
     // 作成・更新（使用記録の追加・購入連携・論理削除）は管理者のみ許可。
     match /ballEntries/{entryId} {
       allow read: if true;
-      allow create, update: if request.auth != null
-                             && request.auth.uid == 'D4ZDzT4bjlazjno8O0Xt93XujHo1'
+      allow create, update: if isAdmin()
                              && request.resource.data.keys().hasAll(['date', 'kind', 'balls']);
       allow delete: if false;
     }
 
     // ボール種類マスタ：全員が閲覧可能。
-    // 追加・名前変更・論理削除は管理者のみ許可。
+    // 追加・名前変更・並び替え・論理削除は管理者のみ許可。
     match /ballTypes/{typeId} {
       allow read: if true;
-      allow create, update: if request.auth != null
-                             && request.auth.uid == 'D4ZDzT4bjlazjno8O0Xt93XujHo1'
+      allow create, update: if isAdmin()
                              && request.resource.data.keys().hasAll(['name']);
       allow delete: if false;
     }
 
     // コートマスタ：全員が閲覧可能。
-    // 追加・名前変更・論理削除は管理者のみ許可。
+    // 追加・名前変更・並び替え・論理削除は管理者のみ許可。
     match /courts/{courtId} {
       allow read: if true;
-      allow create, update: if request.auth != null
-                             && request.auth.uid == 'D4ZDzT4bjlazjno8O0Xt93XujHo1'
+      allow create, update: if isAdmin()
                              && request.resource.data.keys().hasAll(['name']);
+      allow delete: if false;
+    }
+
+    // メンバーマスタ：管理者だけが読み書きできる（一般の閲覧者には見えない）。
+    match /members/{memberId} {
+      allow read: if isAdmin();
+      allow create, update: if isAdmin()
+                             && request.resource.data.keys().hasAll(['name']);
+      allow delete: if false;
+    }
+
+    // 非公開項目（参加者・非公開メモ・実質購入額）：管理者だけが読み書きできる。
+    // ドキュメントIDは、対応する transactions / ballEntries のIDと同じ。
+    match /privateDetails/{detailId} {
+      allow read: if isAdmin();
+      allow create, update: if isAdmin();
       allow delete: if false;
     }
   }
